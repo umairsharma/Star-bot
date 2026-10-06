@@ -104,6 +104,13 @@ def assess(http, robots, finder, brave, clinic, city_name):
         result = check_website(http, robots, clinic["website"])
     except (requests.RequestException, ValueError) as exc:  # e.g. a bad URL in the map data
         result = {"issues": [("website_dead", type(exc).__name__)], "info": []}
+    dead = dict(result["issues"]).get("website_dead")
+    if dead and not info:  # the map's link is dead; the clinic may have moved to a new domain
+        found = finder.find(clinic, city_name)
+        if found and found.rstrip("/") != clinic["website"].rstrip("/"):
+            info.append(f"map link is dead ({dead}); current site found by guessing its domain")
+            clinic["website"] = found
+            result = check_website(http, robots, found)
     info += result["info"]
     if any("checked the homepage instead" in i for i in info):
         clinic["website"] = result["url"]

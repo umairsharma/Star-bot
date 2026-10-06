@@ -169,6 +169,46 @@ class WebsiteFinderTests(unittest.TestCase):
         self.assertFalse(page_matches("A dentist in Bristol", clinic, "Bristol"))
 
 
+class AssessTests(unittest.TestCase):
+    """cli.assess with fake web access: the finder runs for missing and dead websites."""
+
+    class Finder:
+        def __init__(self, result):
+            self.result = result
+
+        def find(self, clinic, city):
+            return self.result
+
+    class NoBrave:
+        enabled = False
+
+    def assess(self, website, pages, finder_result):
+        from clinic_scout import cli
+        clinic = {"name": "Smile Dental", "website": website, "phone": "", "postcode": ""}
+        web = FakeWeb(pages)
+        cli.assess(web, RobotsCache(web), self.Finder(finder_result), self.NoBrave(), clinic, "Bath")
+        return clinic
+
+    def test_missing_website_unverified_scores_3(self):
+        clinic = self.assess("", {}, None)
+        self.assertEqual((clinic["score"], clinic["unverified"]), (3, True))
+
+    def test_found_website_is_checked(self):
+        clinic = self.assess("", {"https://smile.example/": FakeSiteResponse(200, GOOD_SITE)}, "https://smile.example/")
+        self.assertEqual((clinic["score"], clinic["website"]), (0, "https://smile.example/"))
+        self.assertIn("missing from OpenStreetMap", clinic["issues"])
+
+    def test_dead_map_link_with_new_site_checks_the_new_site(self):
+        pages = {"https://smile.example/": FakeSiteResponse(200, GOOD_SITE)}
+        clinic = self.assess("https://old-smile.example/", pages, "https://smile.example/")
+        self.assertEqual((clinic["score"], clinic["website"]), (0, "https://smile.example/"))
+        self.assertIn("map link is dead (HTTP 404)", clinic["issues"])
+
+    def test_dead_map_link_without_new_site_stays_dead(self):
+        clinic = self.assess("https://old-smile.example/", {}, None)
+        self.assertEqual(clinic["score"], 10)
+
+
 class BraveTests(unittest.TestCase):
     def test_skips_directories_and_matches_name(self):
         urls = ["https://www.yelp.co.uk/biz/circus-dental", "https://www.facebook.com/circusdental",
