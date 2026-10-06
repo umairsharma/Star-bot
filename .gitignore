@@ -2,5 +2,5 @@
 __pycache__/
 *.pyc
 .venv/
-results.csv
+results*.csv
 .cache/
