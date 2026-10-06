@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 
 import requests
 
@@ -16,10 +17,14 @@ DEFAULT_ENDPOINTS = [
 # OSM's newer `healthcare=*` tag uses slightly different values than `amenity=*`.
 HEALTHCARE_EQUIVALENT = {"doctors": "doctor"}
 DUPLICATE_DISTANCE_M = 150
+# Public NHS/hospital units: not marketing prospects, skipped unless --include-public.
+PUBLIC_NAME = re.compile(r"\b(nhs|hospital|infirmary|walk[- ]in)\b", re.I)
+PUBLIC_OPERATOR = re.compile(r"\b(nhs|trust)\b", re.I)
+HOSPITAL_SPECIALITIES = {"cystic_fibrosis", "oncology", "radiotherapy", "dialysis", "emergency", "intensive_care"}
 
 
-def build_query(city_info, types, limit, radius_m):
-    """Search inside the city's boundary, or around its centre if it has none."""
+def build_query(city_info, types, radius_m):
+    """Search the whole city: inside its boundary, or around its centre if it has none."""
     if city_info["osm_type"] == "relation":
         scope_setup = f"area({3600000000 + city_info['osm_id']})->.city;"
         scope = "(area.city)"
@@ -35,7 +40,7 @@ def build_query(city_info, types, limit, radius_m):
   nwr["amenity"~"{amenity_re}"]["name"]{scope};
   nwr["healthcare"~"{healthcare_re}"]["name"]{scope};
 );
-out tags center {int(limit)};
+out tags center;
 """.strip()
 
 
@@ -72,6 +77,16 @@ def _address(tags):
     return ", ".join(p for p in (street, town) if p)
 
 
+def is_public_unit(tags):
+    specialities = set(re.split(r"\s*;\s*", tags.get("healthcare:speciality", "")))
+    return bool(
+        PUBLIC_NAME.search(tags.get("name", ""))
+        or PUBLIC_OPERATOR.search(tags.get("operator", ""))
+        or tags.get("healthcare") == "hospital"
+        or specialities & HOSPITAL_SPECIALITIES
+    )
+
+
 def _distance_m(a, b):
     if None in (a["lat"], b["lat"]):
         return math.inf
@@ -100,6 +115,9 @@ def parse_elements(data):
             "address": _address(tags),
             "website": (tags.get("website") or tags.get("contact:website") or tags.get("url") or "").strip(),
             "opening_hours": tags.get("opening_hours", ""),
+            "postcode": tags.get("addr:postcode", ""),
+            "street": tags.get("addr:street", ""),
+            "public": is_public_unit(tags),
             "osm_url": f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
             "lat": center.get("lat"),
             "lon": center.get("lon"),

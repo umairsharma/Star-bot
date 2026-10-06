@@ -1,8 +1,11 @@
 """Turn website-check issues into a score and a one-sentence note."""
 
+import re
+
 # Points per weakness. Higher score = more likely to need marketing help.
 WEIGHTS = {
-    "no_website": 10,
+    "no_website": 10,  # confirmed: not on the map, at guessed domains, or in Brave search
+    "no_website_unverified": 3,  # not on the map or at guessed domains, but not searched
     "website_dead": 10,
     "no_https": 2,
     "no_viewport": 2,
@@ -16,6 +19,7 @@ WEIGHTS = {
 # How each issue reads in the `issues` column ({} is the issue's detail).
 LABELS = {
     "no_website": "no own website ({})",
+    "no_website_unverified": "no website found ({}), not verified",
     "website_dead": "website down ({})",
     "no_https": "no HTTPS",
     "no_viewport": "not mobile-friendly (no viewport tag)",
@@ -58,12 +62,14 @@ def issues_text(issues, info=()):
 def note(issues, info=()):
     codes = {code: detail for code, detail in issues}
     if "no_website" in codes:
-        detail = codes["no_website"]
-        if detail.startswith("only a"):
-            return f"No website of their own ({detail}), so they're hard to find and book online."
-        if "search" in detail:
-            return "No website found anywhere, so new patients can't find or book them online."
-        return "No website listed on the map, so they may be invisible to patients searching online."
+        listing = re.search(r"\ba (\S+\.\S+) page", codes["no_website"])
+        if listing:
+            return f"Their only web presence is a {listing.group(1)} page, so they're hard to find and book online."
+        return "No website found anywhere, so new patients can't find or book them online."
+    if "no_website_unverified" in codes:
+        listing = re.search(r"\ba (\S+\.\S+) page", codes["no_website_unverified"])
+        lead = f"Map links only to a {listing.group(1)} page" if listing else "No website on the map"
+        return f"{lead} and none found at likely domains; worth a quick manual check."
     if "website_dead" in codes:
         return f"Their website is broken ({codes['website_dead']}), so online visitors hit a dead end."
     ranked = sorted((c for c in codes if c in NOTE_PHRASES), key=lambda c: -WEIGHTS[c])

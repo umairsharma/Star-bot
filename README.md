@@ -32,21 +32,32 @@ clinic-scout --city Bath --country "United Kingdom" --limit 20
 | `--radius-km` | `5` | Search radius if the city has no boundary on the map |
 | `--output` | `results.csv` | Output file |
 | `--refresh` | off | Ignore cached OpenStreetMap results (cached for 24 h in `.cache/`) |
+| `--include-public` | off | Keep public NHS/hospital units (skipped by default) |
 
 Output: `results.csv` with `name, phone, address, website, score, issues, note`,
 plus a summary table in the terminal.
 
 ## How it works
 
-1. **Find the city** with Nominatim, then **find clinics** inside its boundary with
-   Overpass (`amenity=` and the newer `healthcare=` tags). If every Overpass server
-   is down it falls back to a Nominatim search. Unnamed entries are skipped and the
-   same clinic mapped twice (point + building) is merged.
-2. **Check each website** (homepage only, 10 s timeout) and add points:
+1. **Find the city** with Nominatim, then fetch **every clinic** inside its boundary
+   from Overpass (`amenity=` and the newer `healthcare=` tags). If every Overpass
+   server is down it falls back to a Nominatim search. Unnamed entries are skipped
+   and the same clinic mapped twice (point + building) is merged.
+2. **Pick which clinics to check.** Public NHS/hospital units are skipped (by name,
+   operator, or hospital-only speciality). Then up to `--limit` clinics are checked,
+   those with their own website first, since their results are the most reliable.
+3. **Find missing websites for free.** For clinics with no website on the map (or
+   only a listing page), likely domains are guessed from the name
+   (`ashleydowndentalcare.co.uk`, `ashleydowndental.co.uk`, …). Each guess gets a
+   DNS lookup first, and a page only counts if it mentions the clinic's postcode,
+   phone number, or its name together with the city. Found sites are checked like
+   any other.
+4. **Check each website** (homepage only, 10 s timeout) and add points:
 
    | Weakness | Points |
    |---|---|
-   | No own website (none on the map, or only a Facebook/NHS/directory page) | 10 |
+   | No own website, confirmed by Brave search too | 10 |
+   | No website on the map or at guessed domains (unverified) | 3 |
    | Website down (DNS error, timeout, HTTP error, parked domain) | 10 |
    | No HTTPS | 2 |
    | No mobile viewport meta tag | 2 |
@@ -56,20 +67,21 @@ plus a summary table in the terminal.
    | No Meta Pixel or Google Ads tags | 1 |
    | No Facebook or Instagram links | 2 |
 
-   Weights live in `clinic_scout/scoring.py`. "No website" scores 10 rather than 5
-   so clinics with no web presence rank above clinics that just have a weak site.
+   Weights live in `clinic_scout/scoring.py`. OpenStreetMap often lacks websites
+   that do exist, so an unconfirmed "no website" scores only 3, and confirmed
+   problems rank first. At equal scores, checked sites rank above unverified ones.
 
    Some sites are reported as "not checked" (0 points) rather than scored, so they
    don't get false scores: robots.txt disallows us, the site shows a bot-protection
    or captcha page, or the content is rendered by JavaScript (partial checks only).
    Sites using Google Tag Manager aren't penalised for missing ad tags, since
    GTM can load them invisibly.
-3. **Optional Brave check.** If `BRAVE_API_KEY` is set in `.env`, clinics with no
-   website on the map are searched on Brave (`"name" city`) before being scored,
-   and a found website is checked like any other. Without a key this step is
-   skipped and everything else works the same. A Brave Search API key needs a
+5. **Optional Brave check.** If `BRAVE_API_KEY` is set in `.env`, clinics still
+   without a website after the domain guess are searched on Brave (`"name" city`).
+   Nothing found there confirms "no website" (10 points); a found site is checked
+   like any other. Without a key this step is skipped and everything else works. A Brave Search API key needs a
    Brave account; check Brave's current plans for free usage limits.
-4. **Export** the top `--top` clinics by score to CSV and print a summary.
+6. **Export** the top `--top` clinics by score to CSV and print a summary.
 
 ## Good manners built in
 

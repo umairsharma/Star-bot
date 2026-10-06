@@ -4,7 +4,8 @@ import datetime
 import time
 import unittest
 
-from clinic_scout import overpass, scoring
+from clinic_scout import output, overpass, scoring
+from clinic_scout.website_finder import domain_guesses, page_matches
 from clinic_scout.brave import pick_own_site
 from clinic_scout.http_client import RobotsCache
 from clinic_scout.website_checks import analyse_html, check_website, listing_host
@@ -82,11 +83,21 @@ class AnalyseHtmlTests(unittest.TestCase):
 class OverpassTests(unittest.TestCase):
     def test_query_uses_area_for_relations_and_radius_otherwise(self):
         rel = {"osm_type": "relation", "osm_id": 5342409, "lat": 51.38, "lon": -2.36}
-        q = overpass.build_query(rel, ["clinic", "doctors"], 20, 5000)
+        q = overpass.build_query(rel, ["clinic", "doctors"], 5000)
         self.assertIn("area(3605342409)", q)
         self.assertIn('"healthcare"~"^(clinic|doctor)$"', q)
+        self.assertIn("out tags center;", q)  # whole city, no cap
         node = dict(rel, osm_type="node")
-        self.assertIn("around:5000,51.38,-2.36", overpass.build_query(node, ["dentist"], 20, 5000))
+        self.assertIn("around:5000,51.38,-2.36", overpass.build_query(node, ["dentist"], 5000))
+
+    def test_public_units(self):
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol City Gate NHS walk-in centre"}))
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol Eye Hospital Assessment Clinic"}))
+        self.assertTrue(overpass.is_public_unit({"name": "Petherton Resource Centre",
+                                                 "operator": "Avon and Wiltshire Mental Health Partnership NHS Trust"}))
+        self.assertTrue(overpass.is_public_unit({"name": "Breast Care Centre", "healthcare:speciality": "oncology"}))
+        self.assertFalse(overpass.is_public_unit({"name": "Prime Endoscopy Bristol", "healthcare:speciality": "endoscopy"}))
+        self.assertFalse(overpass.is_public_unit({"name": "Circus Dental", "operator": "Bupa"}))
 
     def test_parse_skips_unnamed_and_merges_nearby_duplicates(self):
         data = {"elements": [
@@ -119,13 +130,43 @@ class ScoringTests(unittest.TestCase):
                          "no HTTPS; not mobile-friendly (no viewport tag); slow homepage (4.2s); "
                          "no Facebook or Instagram links")
 
-    def test_no_website_outranks_weak_website(self):
-        self.assertGreater(scoring.score([("no_website", "unverified")]),
-                           scoring.score([(c, "") for c in ("no_https", "no_viewport", "no_booking", "no_social")]))
+    def test_confirmed_problems_outrank_unverified_no_website(self):
+        weak_site = scoring.score([(c, "") for c in ("no_https", "no_viewport", "no_booking", "no_social")])
+        self.assertGreater(scoring.score([("no_website", "none anywhere")]), weak_site)
+        self.assertLess(scoring.score([("no_website_unverified", "none on the map")]), weak_site)
+
+    def test_unverified_ranks_after_checked_site_with_same_score(self):
+        rows = [{"name": "A", "score": 3, "unverified": True}, {"name": "B", "score": 3, "unverified": False},
+                {"name": "C", "score": 5, "unverified": False}]
+        self.assertEqual([r["name"] for r in output.top_results(rows, 3)], ["C", "B", "A"])
+
+    def test_no_website_notes(self):
+        self.assertEqual(scoring.note([("no_website_unverified", "map links only to a www.nhs.uk page; none at guessed domains")]),
+                         "Map links only to a www.nhs.uk page and none found at likely domains; worth a quick manual check.")
+        self.assertEqual(scoring.note([("no_website", "only a facebook.com page")]),
+                         "Their only web presence is a facebook.com page, so they're hard to find and book online.")
 
     def test_info_only_note(self):
         self.assertEqual(scoring.note([], ["not checked: robots.txt disallows it"]),
                          "Website not checked: robots.txt disallows it.")
+
+
+class WebsiteFinderTests(unittest.TestCase):
+    def test_domain_guesses(self):
+        guesses = domain_guesses("Ashley Down Dental Care", "gb")
+        self.assertEqual(guesses[:3], ["ashleydowndentalcare.co.uk", "ashleydowndentalcare.com", "ashleydowndentalcare.uk"])
+        self.assertIn("ashleydowndental.co.uk", guesses)
+        self.assertIn("ashley-down-dental-care.co.uk", guesses)
+        self.assertIn("cliftonpractice.co.uk", domain_guesses("The Clifton Practice", "gb"))
+        self.assertIn("smithandjones.com", domain_guesses("Smith & Jones", "us"))
+
+    def test_page_must_mention_postcode_phone_or_name_and_city(self):
+        clinic = {"name": "Ashley Down Dental Care", "postcode": "BS7 9BL", "phone": "0117 924 5555", "street": ""}
+        self.assertTrue(page_matches("Visit us at 1 Station Rd, Bristol BS7 9BL", clinic, "Bristol"))
+        self.assertTrue(page_matches("Call 0117 9245555 today", clinic, "Bristol"))
+        self.assertTrue(page_matches("Ashley Down Dental Care - your dentist in Bristol", clinic, "Bristol"))
+        self.assertFalse(page_matches("Ashley Down Dental Care, Leeds", clinic, "Bristol"))
+        self.assertFalse(page_matches("A dentist in Bristol", clinic, "Bristol"))
 
 
 class BraveTests(unittest.TestCase):

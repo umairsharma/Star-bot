@@ -35,12 +35,12 @@ class BraveLookup:
         self.enabled = bool(self.key)
 
     def find_website(self, name, city):
-        """Return the clinic's own website URL if search finds one, else None.
+        """Return (url_or_None, searched). `searched` is False if the search didn't run.
 
-        Disables itself (and returns None) on an auth or quota error.
+        Disables itself on an auth or quota error.
         """
         if not self.enabled:
-            return None
+            return None, False
         try:
             resp = self.http.get(
                 SEARCH_URL,
@@ -50,15 +50,15 @@ class BraveLookup:
             )
         except requests.RequestException as exc:
             print(f"  Brave search failed ({exc}); skipping this clinic.")
-            return None
+            return None, False
         if resp.status_code in (401, 402, 403, 422, 429):
             print(f"  Brave API returned HTTP {resp.status_code}; turning the Brave check off for this run.")
             self.enabled = False
-            return None
+            return None, False
         if not resp.ok:
-            return None
+            return None, False
         results = resp.json().get("web", {}).get("results", [])
-        return pick_own_site(name, [r.get("url", "") for r in results])
+        return pick_own_site(name, [r.get("url", "") for r in results]), True
 
 
 def _registered_host(url):

@@ -8,7 +8,7 @@ ATTRIBUTION = "Clinic data © OpenStreetMap contributors, available under the OD
 
 
 def top_results(clinics, top):
-    return sorted(clinics, key=lambda c: (-c["score"], c["name"].lower()))[:top]
+    return sorted(clinics, key=lambda c: (-c["score"], c.get("unverified", False), c["name"].lower()))[:top]
 
 
 def write_csv(rows, path):

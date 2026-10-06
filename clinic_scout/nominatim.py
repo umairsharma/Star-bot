@@ -26,10 +26,10 @@ def _get(http, params):
 def find_city(http, city, country, region=None):
     """Return the best match for the city, or None.
 
-    The result has: name, display_name, osm_type, osm_id, lat, lon,
+    The result has: name, display_name, country_code, osm_type, osm_id, lat, lon,
     bbox (south, north, west, east) and `others` (display names of other matches).
     """
-    params = {"city": city, "limit": 5}
+    params = {"city": city, "limit": 5, "addressdetails": 1}
     if region:
         params["state"] = region
     if len(country.strip()) == 2:
@@ -38,9 +38,9 @@ def find_city(http, city, country, region=None):
         params["country"] = country
     results = _get(http, params)
     if not results:  # structured search is strict; retry as free text
-        free = {"q": ", ".join(p for p in (city, region, country) if p), "limit": 5}
+        free = {"q": ", ".join(p for p in (city, region, country) if p), "limit": 5, "addressdetails": 1}
         if "countrycodes" in params:
-            free = {"q": ", ".join(p for p in (city, region) if p), "limit": 5,
+            free = {"q": ", ".join(p for p in (city, region) if p), "limit": 5, "addressdetails": 1,
                     "countrycodes": params["countrycodes"]}
         results = _get(http, free)
     if not results:
@@ -50,6 +50,7 @@ def find_city(http, city, country, region=None):
     return {
         "name": best.get("name") or city,
         "display_name": best["display_name"],
+        "country_code": (best.get("address") or {}).get("country_code", ""),
         "osm_type": best["osm_type"],
         "osm_id": int(best["osm_id"]),
         "lat": float(best["lat"]),

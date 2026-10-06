@@ -125,7 +125,7 @@ def _fetch(http, robots, url):
         resp.close()
         seconds += time.monotonic() - resp.started_at
         if len(body) < CHALLENGE_MAX_BYTES and not CHALLENGE_PAGE.search(body.decode("latin-1")):
-            target = _meta_refresh_target(body, url)
+            target = _meta_refresh_target(body.decode("utf-8", errors="replace"), url)
             if target and target != url:
                 url = target
                 continue

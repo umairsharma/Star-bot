@@ -11,6 +11,7 @@ from clinic_scout import nominatim, output, overpass, scoring
 from clinic_scout.brave import BraveLookup
 from clinic_scout.http_client import PoliteSession, RobotsCache
 from clinic_scout.website_checks import check_website, listing_host
+from clinic_scout.website_finder import WebsiteFinder
 
 
 def parse_args(argv=None):
@@ -29,6 +30,8 @@ def parse_args(argv=None):
                    help="search radius if the city has no boundary on the map (default: %(default)s)")
     p.add_argument("--output", default="results.csv", help="CSV path (default: %(default)s)")
     p.add_argument("--refresh", action="store_true", help="ignore cached OpenStreetMap results")
+    p.add_argument("--include-public", action="store_true",
+                   help="keep public NHS/hospital units (skipped by default: not marketing prospects)")
     args = p.parse_args(argv)
     args.types = [t.strip().lower() for t in args.types.split(",") if t.strip()]
     if not args.types or not all(re.fullmatch(r"[a-z_]+", t) for t in args.types):
@@ -38,7 +41,18 @@ def parse_args(argv=None):
     return args
 
 
+def _check_order(clinic):
+    """Clinics with their own website first (their checks are the most reliable),
+    then listing-only links, then no website; better contact details first within each."""
+    if clinic["website"] and not listing_host(clinic["website"]):
+        group = 0
+    else:
+        group = 1 if clinic["website"] else 2
+    return group, not (clinic["phone"] or clinic["postcode"]), clinic["name"].lower()
+
+
 def find_clinics(http, args):
+    """Return (clinics to check, city info)."""
     city = nominatim.find_city(http, args.city, args.country, args.region)
     if not city:
         sys.exit(f"Could not find '{args.city}' in '{args.country}'. Check the spelling, or try --region.")
@@ -46,45 +60,63 @@ def find_clinics(http, args):
     if city["others"]:
         print(f"  (also matched: {'; '.join(city['others'][:3])} — use --region to pick another)")
 
-    # Ask for extra rows: duplicates (point + building) get merged away after parsing.
-    query = overpass.build_query(city, args.types, args.limit * 2, args.radius_km * 1000)
+    query = overpass.build_query(city, args.types, args.radius_km * 1000)
     try:
         data = overpass.run_query(http, query, refresh=args.refresh)
         source = "Overpass"
     except RuntimeError as exc:
         print(f"{exc}\nFalling back to Nominatim search (fewer results, max 120 per type).")
-        data = nominatim.search_clinics(http, city, args.types, args.limit * 2)
+        data = nominatim.search_clinics(http, city, args.types, limit=10_000)
         source = "Nominatim"
-    clinics = overpass.parse_elements(data)[: args.limit]
+    clinics = overpass.parse_elements(data)
     print(f"Found {len(clinics)} named clinics via {source} "
-          f"({sum(1 for c in clinics if c['website'])} with a website on the map).\n")
-    return clinics, city["name"]
+          f"({sum(1 for c in clinics if c['website'])} with a website on the map).")
+    public = [c for c in clinics if c["public"]]
+    if public and not args.include_public:
+        clinics = [c for c in clinics if not c["public"]]
+        print(f"Skipped {len(public)} public NHS/hospital units (use --include-public to keep them).")
+    if len(clinics) > args.limit:
+        print(f"Checking {args.limit} of {len(clinics)}, clinics with their own website first.")
+    return sorted(clinics, key=_check_order)[: args.limit], city
 
 
-def assess(http, robots, brave, clinic, city_name):
-    """Fill in clinic['score'], ['issues'] and ['note']."""
+def assess(http, robots, finder, brave, clinic, city_name):
+    """Fill in clinic['score'], ['issues'], ['note'] and ['unverified']."""
     info = []
-    if (not clinic["website"] or listing_host(clinic["website"])) and brave.enabled:
-        found = brave.find_website(clinic["name"], city_name)
+    listing = listing_host(clinic["website"]) if clinic["website"] else None
+    if not clinic["website"] or listing:
+        found, how, searched = finder.find(clinic, city_name), "by guessing its domain", False
+        if not found and brave.enabled:
+            found, searched = brave.find_website(clinic["name"], city_name)
+            how = "via Brave search"
         if found:
             clinic["website"] = found
-            info.append("website found by search but missing from OpenStreetMap")
-    if clinic["website"]:
-        try:
-            result = check_website(http, robots, clinic["website"])
-        except (requests.RequestException, ValueError) as exc:  # e.g. a bad URL in the map data
-            result = {"issues": [("website_dead", type(exc).__name__)], "info": []}
-        issues, info = result["issues"], info + result["info"]
-        if any("checked the homepage instead" in i for i in info):
-            clinic["website"] = result["url"]
-        if not clinic["phone"] and result.get("phone"):
-            clinic["phone"] = result["phone"]  # map had no phone; use the site's tel: link
-    else:
-        detail = "none on the map or in search" if brave.enabled else "none on the map, not verified"
-        issues = [("no_website", detail)]
+            info.append(f"website found {how}; missing from OpenStreetMap")
+        else:
+            where = f"map links only to a {listing} page" if listing else "none on the map"
+            if searched:
+                issues = [("no_website", f"{where}; none at guessed domains or in Brave search")]
+            else:
+                issues = [("no_website_unverified", f"{where}; none at guessed domains")]
+            return _finish(clinic, issues, info)
+
+    try:
+        result = check_website(http, robots, clinic["website"])
+    except (requests.RequestException, ValueError) as exc:  # e.g. a bad URL in the map data
+        result = {"issues": [("website_dead", type(exc).__name__)], "info": []}
+    info += result["info"]
+    if any("checked the homepage instead" in i for i in info):
+        clinic["website"] = result["url"]
+    if not clinic["phone"] and result.get("phone"):
+        clinic["phone"] = result["phone"]  # map had no phone; use the site's tel: link
+    return _finish(clinic, result["issues"], info)
+
+
+def _finish(clinic, issues, info):
     clinic["score"] = scoring.score(issues)
     clinic["issues"] = scoring.issues_text(issues, info)
     clinic["note"] = scoring.note(issues, info)
+    clinic["unverified"] = any(code == "no_website_unverified" for code, _ in issues)
 
 
 def main(argv=None):
@@ -96,20 +128,29 @@ def main(argv=None):
 
     print(f"Searching OpenStreetMap for {', '.join(args.types)} in {args.city}, {args.country}...")
     try:
-        clinics, city_name = find_clinics(http, args)
+        clinics, city = find_clinics(http, args)
     except requests.RequestException as exc:
         sys.exit(f"Could not reach OpenStreetMap services: {exc}")
     if not clinics:
         sys.exit("No named clinics found. Try a bigger --radius-km or different --types.")
-    print("Brave fallback: " + ("on" if brave.enabled else "off (no BRAVE_API_KEY in .env)"))
+    finder = WebsiteFinder(http, robots, city["country_code"])
+    print("Brave fallback: " + ("on" if brave.enabled else "off (no BRAVE_API_KEY in .env)") + "\n")
 
     for i, clinic in enumerate(clinics, 1):
         print(f"[{i}/{len(clinics)}] {clinic['name']}", end=" ", flush=True)
-        assess(http, robots, brave, clinic, city_name)
+        assess(http, robots, finder, brave, clinic, city["name"])
         print(f"-> score {clinic['score']}")
 
     rows = output.top_results(clinics, args.top)
     output.write_csv(rows, args.output)
     print(f"\nTop {len(rows)} of {len(clinics)} clinics (saved to {args.output}):\n")
     output.print_table(rows)
+    found = sum(1 for c in clinics if "missing from OpenStreetMap" in c["issues"])
+    unverified = sum(1 for c in clinics if c["unverified"])
+    if found:
+        print(f"\nFound {found} websites that are missing from OpenStreetMap, and checked them.")
+    if unverified:
+        print(f"{unverified} clinics have no website on the map or at likely domains. They score "
+              f"{scoring.WEIGHTS['no_website_unverified']} (unverified), so confirmed problems rank first."
+              + ("" if brave.enabled else " Add BRAVE_API_KEY to .env to confirm them."))
     print(f"\n{output.ATTRIBUTION}")
