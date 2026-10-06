@@ -8,22 +8,25 @@ from clinic_scout import cache
 
 SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 MAX_PAGES_PER_TYPE = 3  # Nominatim returns at most 40 results per page
+# Common 2-letter inputs that aren't the ISO code Nominatim expects.
+COUNTRY_CODE_ALIASES = {"uk": "gb", "el": "gr"}
 
 
-def _get(http, params):
+def _get(http, params, refresh=False):
     params = {"format": "jsonv2", **params}
     key = repr(sorted(params.items()))
-    cached = cache.load("nominatim", key)
+    cached = None if refresh else cache.load("nominatim", key)
     if cached is not None:
         return cached
     resp = http.get(SEARCH_URL, params=params, timeout=(10, 30), attempts=3)
     resp.raise_for_status()
     data = resp.json()
-    cache.save("nominatim", key, data)
+    if data:  # don't let an empty (possibly transient) answer stick for 24 hours
+        cache.save("nominatim", key, data)
     return data
 
 
-def find_city(http, city, country, region=None):
+def find_city(http, city, country, region=None, refresh=False):
     """Return the best match for the city, or None.
 
     The result has: name, display_name, country_code, osm_type, osm_id, lat, lon,
@@ -32,17 +35,18 @@ def find_city(http, city, country, region=None):
     params = {"city": city, "limit": 5, "addressdetails": 1}
     if region:
         params["state"] = region
-    if len(country.strip()) == 2:
-        params["countrycodes"] = country.strip().lower()
+    code = country.strip().lower()
+    if len(code) == 2:
+        params["countrycodes"] = COUNTRY_CODE_ALIASES.get(code, code)
     else:
         params["country"] = country
-    results = _get(http, params)
+    results = _get(http, params, refresh)
     if not results:  # structured search is strict; retry as free text
         free = {"q": ", ".join(p for p in (city, region, country) if p), "limit": 5, "addressdetails": 1}
         if "countrycodes" in params:
             free = {"q": ", ".join(p for p in (city, region) if p), "limit": 5, "addressdetails": 1,
                     "countrycodes": params["countrycodes"]}
-        results = _get(http, free)
+        results = _get(http, free, refresh)
     if not results:
         return None
     best = results[0]
@@ -73,7 +77,7 @@ def _as_tags(result):
     return tags
 
 
-def search_clinics(http, city_info, types, limit):
+def search_clinics(http, city_info, types, limit, refresh=False):
     """Fallback when every Overpass server is down: search each type inside the city's box.
 
     Returns raw elements in Overpass JSON shape.
@@ -89,7 +93,7 @@ def search_clinics(http, city_info, types, limit):
             }
             if seen_ids:
                 params["exclude_place_ids"] = ",".join(seen_ids)
-            page = _get(http, params)
+            page = _get(http, params, refresh)
             for r in page:
                 seen_ids.append(str(r["place_id"]))
                 if r.get("type") == amenity and r.get("name"):

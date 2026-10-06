@@ -1,6 +1,7 @@
 """Command-line entry point: find clinics, check their websites, score, export."""
 
 import argparse
+import os
 import re
 import sys
 
@@ -10,7 +11,8 @@ from dotenv import load_dotenv
 from clinic_scout import nominatim, output, overpass, scoring
 from clinic_scout.brave import BraveLookup
 from clinic_scout.http_client import PoliteSession, RobotsCache
-from clinic_scout.website_checks import check_website, listing_host
+from clinic_scout.hosts import listing_host
+from clinic_scout.website_checks import check_website
 from clinic_scout.website_finder import WebsiteFinder
 
 
@@ -38,6 +40,9 @@ def parse_args(argv=None):
         p.error("--types must be comma-separated words like clinic,doctors,dentist")
     if args.limit < 1 or args.top < 1:
         p.error("--limit and --top must be at least 1")
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+    if not os.path.isdir(out_dir):  # fail now, not after checking every clinic
+        p.error(f"--output folder does not exist: {out_dir}")
     return args
 
 
@@ -53,7 +58,7 @@ def _check_order(clinic):
 
 def find_clinics(http, args):
     """Return (clinics to check, city info)."""
-    city = nominatim.find_city(http, args.city, args.country, args.region)
+    city = nominatim.find_city(http, args.city, args.country, args.region, refresh=args.refresh)
     if not city:
         sys.exit(f"Could not find '{args.city}' in '{args.country}'. Check the spelling, or try --region.")
     print(f"City: {city['display_name']}")
@@ -66,7 +71,7 @@ def find_clinics(http, args):
         source = "Overpass"
     except RuntimeError as exc:
         print(f"{exc}\nFalling back to Nominatim search (fewer results, max 120 per type).")
-        data = nominatim.search_clinics(http, city, args.types, limit=10_000)
+        data = nominatim.search_clinics(http, city, args.types, limit=10_000, refresh=args.refresh)
         source = "Nominatim"
     clinics = overpass.parse_elements(data)
     print(f"Found {len(clinics)} named clinics via {source} "
@@ -87,8 +92,11 @@ def assess(http, robots, finder, brave, clinic, city_name):
     if not clinic["website"] or listing:
         found, how, searched = finder.find(clinic, city_name), "by guessing its domain", False
         if not found and brave.enabled:
-            found, searched = brave.find_website(clinic["name"], city_name)
+            candidate, searched = brave.find_website(clinic["name"], city_name)
             how = "via Brave search"
+            if candidate:  # only trust it if the page names the clinic (postcode, phone, or name + city)
+                found = finder.verify_url(candidate, clinic, city_name)
+                searched = bool(found)  # an unverifiable result doesn't confirm "no website" either
         if found:
             clinic["website"] = found
             info.append(f"website found {how}; missing from OpenStreetMap")
@@ -102,7 +110,7 @@ def assess(http, robots, finder, brave, clinic, city_name):
 
     try:
         result = check_website(http, robots, clinic["website"])
-    except (requests.RequestException, ValueError) as exc:  # e.g. a bad URL in the map data
+    except requests.RequestException as exc:  # e.g. a bad URL in the map data
         result = {"issues": [("website_dead", type(exc).__name__)], "info": []}
     dead = dict(result["issues"]).get("website_dead")
     if dead and not info:  # the map's link is dead; the clinic may have moved to a new domain
@@ -139,13 +147,17 @@ def main(argv=None):
     except requests.RequestException as exc:
         sys.exit(f"Could not reach OpenStreetMap services: {exc}")
     if not clinics:
-        sys.exit("No named clinics found. Try a bigger --radius-km or different --types.")
+        hint = "different --types" if city["osm_type"] == "relation" else "a bigger --radius-km or different --types"
+        sys.exit(f"No named clinics found. Try {hint}.")
     finder = WebsiteFinder(http, robots, city["country_code"])
     print("Brave fallback: " + ("on" if brave.enabled else "off (no BRAVE_API_KEY in .env)") + "\n")
 
     for i, clinic in enumerate(clinics, 1):
         print(f"[{i}/{len(clinics)}] {clinic['name']}", end=" ", flush=True)
-        assess(http, robots, finder, brave, clinic, city["name"])
+        try:
+            assess(http, robots, finder, brave, clinic, city["name"])
+        except Exception as exc:  # one odd site must never cost the whole run
+            _finish(clinic, [], [f"not checked: unexpected error ({type(exc).__name__})"])
         print(f"-> score {clinic['score']}")
 
     rows = output.top_results(clinics, args.top)
@@ -157,7 +169,13 @@ def main(argv=None):
     if found:
         print(f"\nFound {found} websites that are missing from OpenStreetMap, and checked them.")
     if unverified:
+        if brave.enabled:
+            hint = ""
+        elif brave.key:
+            hint = " The Brave check was turned off during the run (key rejected or over quota)."
+        else:
+            hint = " Add BRAVE_API_KEY to .env to confirm them."
         print(f"{unverified} clinics have no website on the map or at likely domains. They score "
-              f"{scoring.WEIGHTS['no_website_unverified']} (unverified), so confirmed problems rank first."
-              + ("" if brave.enabled else " Add BRAVE_API_KEY to .env to confirm them."))
+              f"{scoring.WEIGHTS['no_website_unverified']} (unverified), so sites with bigger confirmed "
+              f"problems rank above them.{hint}")
     print(f"\n{output.ATTRIBUTION}")

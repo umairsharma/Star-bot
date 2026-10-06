@@ -74,9 +74,9 @@ def note(issues, info=()):
         return f"Their website is broken ({codes['website_dead']}), so online visitors hit a dead end."
     ranked = sorted((c for c in codes if c in NOTE_PHRASES), key=lambda c: -WEIGHTS[c])
     if not ranked:
-        not_checked = [i for i in info if i.startswith("not checked")]
-        if not_checked:
-            return f"Website {not_checked[0]}."
+        caveats = [i for i in info if i.startswith(("not checked", "partly checked"))]
+        if caveats:
+            return f"Website {caveats[0]}."
         return "No obvious website problems found."
     shown = [NOTE_PHRASES[c] for c in ranked[:NOTE_MAX_PHRASES]]
     sentence = "Site " + (shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1])

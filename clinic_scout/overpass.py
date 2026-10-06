@@ -7,6 +7,7 @@ import re
 import requests
 
 from clinic_scout import cache
+from clinic_scout.hosts import listing_host
 
 DEFAULT_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -79,12 +80,21 @@ def _address(tags):
 
 def is_public_unit(tags):
     specialities = set(re.split(r"\s*;\s*", tags.get("healthcare:speciality", "")))
+    names = " ".join(tags.get(k, "") for k in ("name", "alt_name", "official_name", "short_name"))
     return bool(
-        PUBLIC_NAME.search(tags.get("name", ""))
+        PUBLIC_NAME.search(names)
         or PUBLIC_OPERATOR.search(tags.get("operator", ""))
         or tags.get("healthcare") == "hospital"
+        or tags.get("building") == "hospital"
         or specialities & HOSPITAL_SPECIALITIES
     )
+
+
+def _website(tags):
+    """The clinic's website tag. OSM allows several values ("a;b"): prefer one that isn't a listing page."""
+    raw = tags.get("website") or tags.get("contact:website") or tags.get("url") or ""
+    values = [v.strip() for v in raw.split(";") if v.strip()]
+    return next((v for v in values if not listing_host(v)), values[0] if values else "")
 
 
 def _distance_m(a, b):
@@ -113,7 +123,7 @@ def parse_elements(data):
             "type": tags.get("amenity") or tags.get("healthcare", ""),
             "phone": (tags.get("phone") or tags.get("contact:phone") or "").strip(),
             "address": _address(tags),
-            "website": (tags.get("website") or tags.get("contact:website") or tags.get("url") or "").strip(),
+            "website": _website(tags),
             "opening_hours": tags.get("opening_hours", ""),
             "postcode": tags.get("addr:postcode", ""),
             "street": tags.get("addr:street", ""),

@@ -4,6 +4,7 @@ Only the clinic's own site is fetched. Facebook/Instagram/Google links are
 detected in the HTML but never requested.
 """
 
+import codecs
 import datetime
 import re
 import time
@@ -12,10 +13,12 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from clinic_scout.hosts import host_matches, listing_host
+from clinic_scout.http_client import MAX_REDIRECTS, redirect_target
+
 TIMEOUT = 10
 SLOW_SECONDS = 3.0
 MAX_BYTES = 2_000_000
-MAX_REDIRECTS = 5
 MIN_VISIBLE_TEXT = 300  # less than this suggests content is rendered by JavaScript
 
 WHATSAPP_HOSTS = ("wa.me", "whatsapp.com")
@@ -34,7 +37,13 @@ BOOKING_WORDS = re.compile(
     r"prenot\w*|afspraak|randevu|agendar)\b",
     re.I,
 )
-COPYRIGHT_YEAR = re.compile(r"(?:©|\(c\)|copyright)\s*(?:(?:19|20)\d{2}\s*[-–—]\s*)?((?:19|20)\d{2})", re.I)
+# "© 2019", "© 2015-2024", and ranges ending in "present" or a two-digit year ("© 2015-24").
+COPYRIGHT_YEAR = re.compile(
+    r"(?:©|\(c\)|copyright)\s*(?:(?:19|20)\d{2}\s*[-–—]\s*)?((?:19|20)\d{2})"
+    r"(\s*[-–—]\s*(?:present|now|today|current|\d{2}(?!\d)))?",
+    re.I,
+)
+CHARSET_META = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_.:-]+)""", re.I)
 PARKED_WORDS = re.compile(
     r"domain (is|may be) for sale|buy this domain|this domain is parked|parked free|"
     r"domain has expired|future home of something quite cool",
@@ -45,23 +54,11 @@ GOOGLE_ADS = re.compile(r"googleadservices\.com|googleads\.g\.doubleclick\.net|[
 TAG_MANAGER = re.compile(r"googletagmanager\.com/gtm\.js|['\"]GTM-[A-Z0-9]+", re.I)
 # Bot-protection pages served instead of the real site (only checked on small pages).
 CHALLENGE_PAGE = re.compile(
-    r"sgcaptcha|cf-chl|challenge-platform|<title>just a moment|attention required! \| cloudflare|"
+    r"sgcaptcha|cf[-_]chl|<title>just a moment|attention required! \| cloudflare|"
     r"_incapsula_resource|sucuri_cloudproxy|checking your browser|ddos protection by",
     re.I,
 )
 CHALLENGE_MAX_BYTES = 30_000
-
-# Links on the map that point to a listing or social page rather than the clinic's own site.
-# These are never fetched: we don't scrape Google, Facebook, Instagram or directories.
-LISTING_HOSTS = (
-    "facebook.com", "fb.com", "fb.me", "instagram.com", "instagr.am", "goo.gl", "g.page",
-    "business.site", "blogspot.com", "youtube.com", "www.nhs.uk", "yelp.com", "yelp.co.uk",
-    "healthgrades.com", "zocdoc.com", "doctolib.fr", "doctolib.de", "doctolib.it", "doctoralia.com",
-    "doctoralia.es", "practo.com", "jameda.de", "yell.com", "yellowpages.com", "tripadvisor.com",
-    "linkedin.com", "twitter.com", "x.com", "tiktok.com", "linktr.ee", "wa.me", "whatsapp.com",
-)
-GOOGLE_HOST = re.compile(r"(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$")
-
 
 class Disallowed(Exception):
     pass
@@ -71,24 +68,39 @@ class ListingSite(Exception):
     """The URL (or a redirect) leads to a listing/social site we must not fetch."""
 
 
-def _host(url):
-    return urlparse(url).netloc.lower().split(":")[0]
+def _join(base, link):
+    """urljoin that returns "" instead of raising on a malformed link."""
+    try:
+        return urljoin(base, link.strip())
+    except ValueError:
+        return ""
 
 
-def _host_matches(url, hosts):
-    host = _host(url)
-    return any(host == h or host.endswith("." + h) for h in hosts)
+def _path(link):
+    try:
+        return urlparse(link).path
+    except ValueError:
+        return ""
 
 
-def listing_host(url):
-    """Return the listing/social host a URL points to (e.g. 'facebook.com'), or None."""
-    host = _host(url if "//" in url else "//" + url)
-    if GOOGLE_HOST.search(host):
-        return "google.com"
-    for h in LISTING_HOSTS:
-        if host == h or host.endswith("." + h):
-            return h
-    return None
+def decode_body(body, resp):
+    """Decode a page using the header charset, then <meta charset>, then UTF-8.
+
+    Unknown charset names (e.g. "windows-874" on some systems) are skipped.
+    """
+    candidates = []
+    if "charset=" in resp.headers.get("Content-Type", "").lower():
+        candidates.append(resp.encoding)
+    meta = CHARSET_META.search(body[:4096])
+    if meta:
+        candidates.append(meta.group(1).decode("ascii"))
+    for encoding in candidates + ["utf-8"]:
+        try:
+            if encoding and codecs.lookup(encoding):
+                return body.decode(encoding, errors="replace")
+        except LookupError:
+            continue
+    return body.decode("utf-8", errors="replace")
 
 
 def _meta_refresh_target(body, url):
@@ -96,7 +108,7 @@ def _meta_refresh_target(body, url):
     soup = BeautifulSoup(body, "html.parser")
     tag = soup.find("meta", attrs={"http-equiv": re.compile(r"^refresh$", re.I)})
     match = re.search(r"\d*\s*;\s*(?:url\s*=\s*)?['\"]?([^'\"\s]+)", (tag or {}).get("content", ""), re.I)
-    return urljoin(url, match.group(1)) if match else None
+    return (_join(url, match.group(1)) or None) if match else None
 
 
 def _fetch(http, robots, url):
@@ -111,10 +123,10 @@ def _fetch(http, robots, url):
             raise ListingSite(listing_host(url))
         if not robots.allowed(url):
             raise Disallowed(url)
-        resp = http.get(url, timeout=TIMEOUT, allow_redirects=False, stream=True)
+        resp = http.get(url, timeout=TIMEOUT, attempts=2, allow_redirects=False, stream=True)
         if resp.is_redirect and resp.headers.get("Location"):
             seconds += time.monotonic() - resp.started_at
-            url = urljoin(url, resp.headers["Location"])
+            url = redirect_target(url, resp.headers["Location"])
             resp.close()
             continue
         body = b""
@@ -156,6 +168,8 @@ def fetch_homepage(http, robots, website):
         except requests.RequestException as exc:
             last_error = exc
             continue
+        except ValueError:  # malformed URL in the map data
+            return {"error": "invalid URL"}
         return {"url": final_url, "resp": resp, "body": body, "seconds": seconds,
                 "tls_error": isinstance(last_error, requests.exceptions.SSLError)}
     return {"error": _describe_error(last_error)}
@@ -176,7 +190,10 @@ def _describe_error(exc):
 
 
 def _site_root(url):
-    parts = urlparse(url if "//" in url else "https://" + url)
+    try:
+        parts = urlparse(url if "//" in url else "https://" + url)
+    except ValueError:
+        return url
     return f"{parts.scheme}://{parts.netloc}/"
 
 
@@ -213,9 +230,7 @@ def check_website(http, robots, website, today=None):
     if "html" not in content_type:
         return {"issues": [], "info": info + ["not checked: homepage is not an HTML page"], "url": url}
 
-    encoding = resp.encoding if "charset=" in content_type else "utf-8"
-    result = analyse_html(body.decode(encoding or "utf-8", errors="replace"), url,
-                          page["seconds"], page["tls_error"], today)
+    result = analyse_html(decode_body(body, resp), url, page["seconds"], page["tls_error"], today)
     result["info"] = info + result["info"]
     return result
 
@@ -227,8 +242,10 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
     issues, info = [], []
 
     has_scripts = soup.find("script") is not None
-    embeds = [urljoin(url, t.get("src") or t.get("action") or "")
+    has_frames = soup.find(["frameset", "frame"]) is not None
+    embeds = [_join(url, t.get("src") or t.get("action") or "")
               for t in soup.find_all(["iframe", "script", "form"])]
+    iframes = [_join(url, t.get("src") or "") for t in soup.find_all("iframe")]
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
     text = soup.get_text(" ", strip=True)
@@ -243,18 +260,19 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
     if seconds > SLOW_SECONDS:
         issues.append(("slow", f"{seconds:.1f}s"))
 
-    if len(visible_text) < MIN_VISIBLE_TEXT and has_scripts:
-        info.append("page content loads via JavaScript; booking, social, copyright and ad checks skipped")
+    if has_frames or (len(visible_text) < MIN_VISIBLE_TEXT and (has_scripts or iframes)):
+        how = "inside a frame" if has_frames or not has_scripts else "via JavaScript"
+        info.append(f"partly checked: page content loads {how}, so booking, social, copyright and ad checks were skipped")
         return {"issues": issues, "info": info, "url": url}
 
-    hrefs = [urljoin(url, a["href"].strip()) for a in soup.find_all("a", href=True)]
+    hrefs = [h for h in (_join(url, a["href"]) for a in soup.find_all("a", href=True)) if h]
 
     tel_links = [unquote(h[4:]).strip() for h in hrefs if h.lower().startswith("tel:")]
     has_tel = bool(tel_links)
-    has_whatsapp = any(h.lower().startswith("whatsapp:") or _host_matches(h, WHATSAPP_HOSTS) for h in hrefs)
-    has_booking_platform = any(_host_matches(u, BOOKING_HOSTS) for u in hrefs + embeds)
+    has_whatsapp = any(h.lower().startswith("whatsapp:") or host_matches(h, WHATSAPP_HOSTS) for h in hrefs)
+    has_booking_platform = any(host_matches(u, BOOKING_HOSTS) for u in hrefs + embeds if u)
     has_booking_link = any(
-        BOOKING_WORDS.search(a.get_text(" ", strip=True)) or BOOKING_WORDS.search(urlparse(a["href"]).path)
+        BOOKING_WORDS.search(a.get_text(" ", strip=True)) or BOOKING_WORDS.search(_path(a["href"]))
         for a in soup.find_all("a", href=True)
     )
     has_booking_form = any(BOOKING_WORDS.search(f.get_text(" ", strip=True) + " " + str(f.attrs))
@@ -262,7 +280,15 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
     if not (has_tel or has_whatsapp or has_booking_platform or has_booking_link or has_booking_form):
         issues.append(("no_booking", ""))
 
-    years = [int(y) for y in COPYRIGHT_YEAR.findall(text) if 1990 <= int(y) <= today.year + 1]
+    years = []
+    for year, tail in COPYRIGHT_YEAR.findall(text):
+        two_digit_end = re.search(r"\d{2}$", tail)
+        if two_digit_end:
+            year = 2000 + int(two_digit_end.group())  # "© 2015-24"
+        elif tail:
+            year = today.year  # "© 2015-present"
+        if 1990 <= int(year) <= today.year + 1:
+            years.append(int(year))
     if years and max(years) < today.year - 2:
         issues.append(("old_copyright", str(max(years))))
 
@@ -272,7 +298,7 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
         else:
             issues.append(("no_ads", ""))
 
-    if not any(_host_matches(h, SOCIAL_HOSTS) for h in hrefs):
+    if not any(host_matches(u, SOCIAL_HOSTS) for u in hrefs + iframes if u):  # links or embedded widgets
         issues.append(("no_social", ""))
 
     return {"issues": issues, "info": info, "url": url, "phone": tel_links[0] if tel_links else ""}

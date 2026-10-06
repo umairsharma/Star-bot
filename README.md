@@ -24,14 +24,14 @@ clinic-scout --city Bath --country "United Kingdom" --limit 20
 | Option | Default | Meaning |
 |---|---|---|
 | `--city` | required | City name |
-| `--country` | required | Country name or 2-letter code (`GB`, `US`, `DE`) |
+| `--country` | required | Country name or 2-letter code (`GB`, `US`, `DE`; `UK` also works) |
 | `--region` | – | State/county, when the city name exists in several places |
 | `--types` | `clinic,doctors,dentist` | OSM amenity types to search |
 | `--limit` | `100` | Max clinics to check |
 | `--top` | `15` | Rows to keep in the CSV |
 | `--radius-km` | `5` | Search radius if the city has no boundary on the map |
 | `--output` | `results.csv` | Output file |
-| `--refresh` | off | Ignore cached OpenStreetMap results (cached for 24 h in `.cache/`) |
+| `--refresh` | off | Ignore cached OpenStreetMap results (Nominatim and Overpass, cached for 24 h in `.cache/`) |
 | `--include-public` | off | Keep public NHS/hospital units (skipped by default) |
 
 Output: `results.csv` with `name, phone, address, website, score, issues, note`,
@@ -68,18 +68,21 @@ plus a summary table in the terminal.
    | No Facebook or Instagram links | 2 |
 
    Weights live in `clinic_scout/scoring.py`. OpenStreetMap often lacks websites
-   that do exist, so an unconfirmed "no website" scores only 3, and confirmed
-   problems rank first. At equal scores, checked sites rank above unverified ones.
+   that do exist, so an unconfirmed "no website" scores only 3: sites with bigger
+   confirmed problems rank above it. At equal scores, checked sites rank above
+   unverified ones. A failed fetch is retried once before a site counts as down.
 
-   Some sites are reported as "not checked" (0 points) rather than scored, so they
-   don't get false scores: robots.txt disallows us, the site shows a bot-protection
-   or captcha page, or the content is rendered by JavaScript (partial checks only).
+   Some sites aren't scored, so they don't get false scores. They're "not checked"
+   (0 points) when robots.txt disallows us or the site shows a bot-protection or
+   captcha page, and "partly checked" (only HTTPS, mobile and speed are scored)
+   when the content is rendered by JavaScript or shown inside a frame.
    Sites using Google Tag Manager aren't penalised for missing ad tags, since
    GTM can load them invisibly.
 5. **Optional Brave check.** If `BRAVE_API_KEY` is set in `.env`, clinics still
    without a website after the domain guess are searched on Brave (`"name" city`).
-   Nothing found there confirms "no website" (10 points); a found site is checked
-   like any other. Without a key this step is skipped and everything else works. A Brave Search API key needs a
+   Nothing found there confirms "no website" (10 points). A found site must pass
+   the same postcode/phone/name check as a guessed domain, then is checked like
+   any other. Without a key this step is skipped and everything else works. A Brave Search API key needs a
    Brave account; check Brave's current plans for free usage limits.
 6. **Export** the top `--top` clinics by score to CSV and print a summary.
 
@@ -87,8 +90,13 @@ plus a summary table in the terminal.
 
 - Descriptive User-Agent (add `CONTACT_EMAIL` in `.env` to include your contact).
 - At most 1 request per second per domain, plus a 0.3 s gap between any requests.
-- robots.txt is checked on clinic sites, including every redirect.
-- Google, Facebook, Instagram and directory sites are never fetched, even via a redirect.
+- robots.txt is checked on clinic sites, including every redirect, using RFC 9309
+  rules (our own `clinic-scout` group first, longest match wins, `*` and `$` wildcards).
+- Google, Facebook, Instagram, their short links (`g.co`, `m.me`, …) and directory
+  sites are never fetched, not even through a redirect or a robots.txt request.
+  The list is in `clinic_scout/hosts.py`.
+- One odd site (bad charset, malformed links) can't stop the run; it's marked
+  "not checked" and the run carries on.
 - OpenStreetMap results are cached for 24 hours.
 
 ## Settings (`.env`)

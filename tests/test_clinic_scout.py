@@ -3,8 +3,13 @@
 import datetime
 import time
 import unittest
+from unittest import mock
 
-from clinic_scout import output, overpass, scoring
+from clinic_scout import nominatim, output, overpass, scoring
+from clinic_scout.hosts import listing_host as hosts_listing_host, site_key
+from clinic_scout.http_client import parse_robots, robots_allows
+from clinic_scout.website_checks import decode_body
+from clinic_scout.website_finder import ascii_words
 from clinic_scout.website_finder import domain_guesses, page_matches
 from clinic_scout.brave import pick_own_site
 from clinic_scout.http_client import RobotsCache
@@ -220,8 +225,13 @@ class BraveTests(unittest.TestCase):
 
 
 class FakeResponse:
-    def __init__(self, status, text=""):
+    def __init__(self, status, text="", headers=None):
         self.status_code, self.text = status, text
+        self.headers = headers or {}
+        self.is_redirect = status in (301, 302, 303, 307, 308) and "Location" in self.headers
+
+    def close(self):
+        pass
 
 
 class FakeHttp:
@@ -268,7 +278,7 @@ class FakeWeb:
 
     def get(self, url, **kwargs):
         self.requested.append(url)
-        if url.endswith("/robots.txt"):
+        if url.endswith("/robots.txt") and url not in self.pages:
             return FakeResponse(404)
         resp = self.pages.get(url) or FakeSiteResponse(404)
         resp.started_at = time.monotonic()
@@ -321,6 +331,127 @@ class CheckWebsiteTests(unittest.TestCase):
         self.assertEqual(listing_host("https://www.nhs.uk/services/gp-surgery/x"), "www.nhs.uk")
         self.assertIsNone(listing_host("https://www.oldfieldsurgery.nhs.uk/"))
         self.assertIsNone(listing_host("https://googleclinic.example/"))
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Regression tests for issues found in the pre-PR review."""
+
+    def run_check(self, pages, website):
+        web = FakeWeb(pages)
+        return check_website(web, RobotsCache(web), website, today=TODAY), web.requested
+
+    def test_robots_redirect_to_facebook_is_never_requested(self):
+        fb = {"Location": "https://www.facebook.com/smileclinic"}
+        pages = {"https://smileclinic.example/robots.txt": FakeResponse(301, headers=fb),
+                 "https://smileclinic.example/": FakeSiteResponse(301, headers=fb)}
+        result, requested = self.run_check(pages, "https://smileclinic.example/")
+        self.assertEqual(result["issues"], [("no_website", "only a facebook.com page")])
+        self.assertFalse(any("facebook" in u for u in requested), requested)
+
+    def test_robots_rules_rfc9309(self):
+        rules = parse_robots("\ufeffUser-agent: *\nDisallow: /private\nAllow: /private/ok\n"
+                             "Disallow: /*.pdf$\n\nUser-agent: otherbot\nDisallow: /\n")
+        self.assertFalse(robots_allows(rules, "https://a.example/private/x"))
+        self.assertTrue(robots_allows(rules, "https://a.example/private/ok/page"))  # longest match wins
+        self.assertFalse(robots_allows(rules, "https://a.example/files/a.pdf"))  # wildcard + end anchor
+        self.assertTrue(robots_allows(rules, "https://a.example/files/a.pdf?x=1"))
+        self.assertTrue(robots_allows(rules, "https://a.example/"))
+        ours = parse_robots("User-agent: *\nDisallow: /\n\nUser-agent: clinic-scout\nAllow: /\n")
+        self.assertTrue(robots_allows(ours, "https://a.example/page"))  # our own group wins over *
+
+    def test_www_and_apex_share_a_rate_limit(self):
+        self.assertEqual(site_key("https://www.clinic.example/a"), site_key("http://clinic.example/b"))
+
+    def test_short_links_and_directories_are_listing_hosts(self):
+        for url in ("https://g.co/kgs/AbC", "https://share.google/xyz", "https://m.me/clinic", "https://youtu.be/x",
+                    "https://ig.me/x", "https://www.trustpilot.com/review/x", "https://maps.apple.com/?q=x",
+                    "https://www.cqc.org.uk/location/1", "https://about.google/"):
+            self.assertIsNotNone(hosts_listing_host(url), url)
+        self.assertIsNone(hosts_listing_host("https://www.oldfieldsurgery.nhs.uk/"))
+        self.assertIsNone(hosts_listing_host("http://[bad"))  # malformed URLs don't raise
+
+    def test_unknown_charset_falls_back_instead_of_crashing(self):
+        resp = FakeSiteResponse(200, headers={"Content-Type": "text/html; charset=windows-874"})
+        resp.encoding = "windows-874-not-a-codec"
+        self.assertEqual(decode_body("caf\u00e9".encode(), resp), "caf\u00e9")
+        resp = FakeSiteResponse(200, headers={"Content-Type": "text/html"})
+        body = '<meta charset="iso-8859-1"><p>\u00a9 2019</p>'.encode("iso-8859-1")
+        self.assertIn("\u00a9 2019", decode_body(body, resp))  # <meta charset> is honoured
+
+    def test_malformed_href_does_not_mark_site_dead(self):
+        html = GOOD_SITE.replace("</body>", '<a href="http://[broken">x</a></body>')
+        self.assertEqual(analyse_html(html, "https://smile.example/", 0.5, today=TODAY)["issues"], [])
+
+    def test_copyright_ranges_to_present_or_two_digit_years(self):
+        def codes(footer):
+            html = WEAK_SITE.replace("Copyright 2019 Old Surgery", footer)
+            return [c for c, _ in analyse_html(html, "https://x.example/", 0.5, today=TODAY)["issues"]]
+        self.assertNotIn("old_copyright", codes("© 2015-present Old Surgery"))
+        self.assertNotIn("old_copyright", codes("© 2015-25 Old Surgery"))
+        self.assertIn("old_copyright", codes("© 2012-19 Old Surgery"))
+
+    def test_facebook_widget_iframe_counts_as_social(self):
+        html = WEAK_SITE.replace("</body>", '<iframe src="https://www.facebook.com/plugins/page.php?href=x"></iframe></body>')
+        codes = [c for c, _ in analyse_html(html, "https://x.example/", 0.5, today=TODAY)["issues"]]
+        self.assertNotIn("no_social", codes)
+
+    def test_cloudflare_analytics_script_is_not_a_bot_page(self):
+        page = GOOD_SITE.replace("</body>", '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body>')
+        result, _ = self.run_check({"https://clinic.example/": FakeSiteResponse(200, page)}, "https://clinic.example/")
+        self.assertFalse(any("bot-protection" in i for i in result["info"]))
+
+    def test_frameset_page_is_partly_checked(self):
+        html = '<html><frameset><frame src="https://real-site.example/"></frameset></html>'
+        result = analyse_html(html, "https://clinic.example/", 0.5, today=TODAY)
+        self.assertNotIn("no_booking", [c for c, _ in result["issues"]])
+        self.assertTrue(result["info"][0].startswith("partly checked"))
+        self.assertEqual(scoring.note(result["issues"], result["info"])[:30], "Site isn't mobile-friendly.")
+
+    def test_partly_checked_note(self):
+        self.assertTrue(scoring.note([], ["partly checked: page content loads via JavaScript"]).startswith(
+            "Website partly checked"))
+
+    def test_finder_matches_whole_words_only(self):
+        clinic = {"name": "Smile Dental", "postcode": "", "phone": "", "street": ""}
+        self.assertFalse(page_matches("Smile Dental: a lovely practice", clinic, "Ely"))
+        self.assertTrue(page_matches("Smile Dental, your dentist in Ely", clinic, "Ely"))
+
+    def test_numeric_postcode_needs_the_city_too(self):
+        clinic = {"name": "Harbour Dental", "postcode": "2000", "phone": "", "street": ""}
+        self.assertFalse(page_matches("Established 2000. Call us today.", clinic, "Sydney"))
+        self.assertTrue(page_matches("Level 2, George St, Sydney NSW 2000", clinic, "Sydney"))
+
+    def test_accented_names_make_real_domain_guesses(self):
+        self.assertEqual(ascii_words("Clínica Dental São Paulo"), ["clinica", "dental", "sao", "paulo"])
+        self.assertIn("clinicadentalsaopaulo.com.br", domain_guesses("Clínica Dental São Paulo", "br"))
+
+    def test_multi_value_website_prefers_own_site(self):
+        data = {"elements": [{"type": "node", "id": 1, "lat": 1, "lon": 1, "tags": {
+            "amenity": "dentist", "name": "X", "website": "https://facebook.com/x;https://x.example"}}]}
+        self.assertEqual(overpass.parse_elements(data)[0]["website"], "https://x.example")
+
+    def test_uk_country_code_alias(self):
+        sent = []
+
+        class Http:
+            def get(self, url, params=None, **kwargs):
+                sent.append(params)
+                return type("R", (), {"raise_for_status": lambda self: None, "json": lambda self: []})()
+
+        with mock.patch.object(nominatim.cache, "load", return_value=None), \
+                mock.patch.object(nominatim.cache, "save") as save:
+            nominatim.find_city(Http(), "Bath", "UK")
+        self.assertEqual(sent[0]["countrycodes"], "gb")
+        save.assert_not_called()  # empty answers aren't cached
+
+    def test_brave_never_matches_on_empty_or_city_words(self):
+        self.assertIsNone(pick_own_site("東京歯科", ["https://anything.example/"], "Tokyo"))
+        self.assertIsNone(pick_own_site("Bristol Dental", ["https://www.bristol-council.example/"], "Bristol"))
+
+    def test_missing_output_folder_fails_before_the_run(self):
+        from clinic_scout import cli
+        with self.assertRaises(SystemExit):
+            cli.parse_args(["--city", "Bath", "--country", "GB", "--output", "/no/such/folder/out.csv"])
 
 
 if __name__ == "__main__":
