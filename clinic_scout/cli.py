@@ -40,9 +40,14 @@ def parse_args(argv=None):
         p.error("--types must be comma-separated words like clinic,doctors,dentist")
     if args.limit < 1 or args.top < 1:
         p.error("--limit and --top must be at least 1")
+    # Fail now, not after checking every clinic.
+    if args.output.endswith(("/", os.sep)) or os.path.isdir(args.output):
+        p.error(f"--output must be a file path, not a folder: {args.output}")
     out_dir = os.path.dirname(os.path.abspath(args.output))
-    if not os.path.isdir(out_dir):  # fail now, not after checking every clinic
+    if not os.path.isdir(out_dir):
         p.error(f"--output folder does not exist: {out_dir}")
+    if not os.access(out_dir, os.W_OK):
+        p.error(f"--output folder is not writable: {out_dir}")
     return args
 
 

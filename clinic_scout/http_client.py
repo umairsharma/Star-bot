@@ -3,12 +3,12 @@
 import os
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import requests
 
 from clinic_scout import __version__
-from clinic_scout.hosts import listing_host, site_key
+from clinic_scout.hosts import host_of, listing_host, site_key
 
 PER_DOMAIN_DELAY = 1.0  # seconds between requests to the same domain
 GLOBAL_DELAY = 0.3  # seconds between any two requests
@@ -97,7 +97,7 @@ def parse_robots(text, agent=ROBOTS_AGENT):
     Groups naming our product token win over `*`; all matching groups are merged.
     """
     groups, in_agent_lines = [], False
-    for raw in text.lstrip("﻿").splitlines():
+    for raw in re.split(r"\r\n|\r|\n", text.lstrip("\ufeff")):
         line = raw.split("#", 1)[0].strip()
         if ":" not in line:
             continue
@@ -117,8 +117,13 @@ def parse_robots(text, agent=ROBOTS_AGENT):
     return [rule for g in chosen for rule in g["rules"]]
 
 
+def _normalise(path):
+    """Percent-encoding normalisation (RFC 9309 2.2.2): "/~joe" and "/%7Ejoe" compare equal."""
+    return quote(unquote(path), safe="/?&=;:@!$'()*+,~-._")
+
+
 def _pattern_matches(pattern, path):
-    regex = re.escape(pattern).replace(r"\*", ".*")
+    regex = re.escape(_normalise(pattern)).replace(r"\*", ".*")
     if regex.endswith(r"\$"):
         regex = regex[:-2] + "$"
     return re.match(regex, path) is not None
@@ -126,8 +131,8 @@ def _pattern_matches(pattern, path):
 
 def robots_allows(rules, url):
     """Longest matching rule wins; on a tie, allow wins. No matching rule means allowed."""
-    parts = urlparse(url)
-    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    parts = urlsplit(url)  # unlike urlparse, keeps ";jsessionid=..." in the path
+    path = _normalise((parts.path or "/") + (f"?{parts.query}" if parts.query else ""))
     best = None
     for allow, pattern in rules:
         if pattern and _pattern_matches(pattern, path):
@@ -167,12 +172,13 @@ class RobotsCache:
                 return DISALLOW_ALL
             if resp.status_code >= 400:
                 return ALLOW_ALL
-            return parse_robots(resp.text)
+            # RFC 9309: robots.txt is UTF-8, whatever (or whether) the server declares.
+            return parse_robots(resp.content.decode("utf-8", errors="replace"))
         return ALLOW_ALL  # too many redirects: RFC 9309 treats robots.txt as unavailable
 
     def allowed(self, url):
-        parts = urlparse(url)
-        root = f"{parts.scheme}://{parts.netloc}"
-        if root not in self._rules:
-            self._rules[root] = self._fetch_rules(root)
-        return robots_allows(self._rules[root], url)
+        parts = urlsplit(url)
+        key = (parts.scheme.lower(), host_of(url), parts.port)  # "Clinic.example" == "clinic.example"
+        if key not in self._rules:
+            self._rules[key] = self._fetch_rules(f"{parts.scheme}://{parts.netloc}")
+        return robots_allows(self._rules[key], url)

@@ -72,8 +72,10 @@ def page_matches(text, clinic, city):
     postcode = _norm(clinic.get("postcode", ""))
     if len(postcode.replace(" ", "")) >= 4:
         found = has(postcode) or has(postcode.replace(" ", ""))
-        # All-digit postcodes (e.g. "2000", "8001") also look like years and prices.
-        if found and (city_named or not postcode.replace(" ", "").isdigit()):
+        # All-digit postcodes (e.g. "2000", "8001") also look like years and prices, so they
+        # need the city too, unless the city's name has no Latin letters to look for.
+        numeric = postcode.replace(" ", "").isdigit()
+        if found and (not numeric or city_named or not _norm(city)):
             return True
     phone = re.sub(r"\D", "", clinic.get("phone", ""))[-9:]
     if len(phone) == 9 and phone in re.sub(r"\D", "", text):
@@ -108,8 +110,11 @@ class WebsiteFinder:
             page = fetch_homepage(self.http, self.robots, url)
             if "resp" not in page:
                 return "unreachable", None
-            if page["resp"].status_code >= 400:
-                return "other", None
+            status = page["resp"].status_code
+            if status in (401, 403, 429):
+                return "other", None  # bot protection; the www. host will be behind it too
+            if status >= 400:
+                return "unreachable", None  # no page here; the www. variant may still work
             text = BeautifulSoup(decode_body(page["body"], page["resp"]), "html.parser").get_text(" ", strip=True)
         except (requests.RequestException, ValueError, LookupError):
             return "unreachable", None

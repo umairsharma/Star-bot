@@ -40,9 +40,12 @@ BOOKING_WORDS = re.compile(
 # "© 2019", "© 2015-2024", and ranges ending in "present" or a two-digit year ("© 2015-24").
 COPYRIGHT_YEAR = re.compile(
     r"(?:©|\(c\)|copyright)\s*(?:(?:19|20)\d{2}\s*[-–—]\s*)?((?:19|20)\d{2})"
-    r"(\s*[-–—]\s*(?:present|now|today|current|\d{2}(?!\d)))?",
+    r"(\s*[-–—]\s*(?:(?:present|now|today|current)\b|\d{2}(?!\d)))?",
     re.I,
 )
+# Iframes that are embeds (maps, video, widgets), not a frame wrapping the whole site.
+EMBED_HOSTS = ("youtube-nocookie.com", "vimeo.com", "googleusercontent.com", "gstatic.com", "doubleclick.net")
+BOMS = ((codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"))
 CHARSET_META = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_.:-]+)""", re.I)
 PARKED_WORDS = re.compile(
     r"domain (is|may be) for sale|buy this domain|this domain is parked|parked free|"
@@ -84,21 +87,28 @@ def _path(link):
 
 
 def decode_body(body, resp):
-    """Decode a page using the header charset, then <meta charset>, then UTF-8.
-
-    Unknown charset names (e.g. "windows-874" on some systems) are skipped.
+    """Decode a page the way browsers do: a BOM wins, then the header charset, then
+    <meta charset>, then UTF-8. Unknown or non-text charset names are skipped, and a
+    <meta> that claims UTF-16/32 means UTF-8 (HTML spec).
     """
+    for bom, encoding in BOMS:
+        if body.startswith(bom):
+            return body.decode(encoding, errors="replace").lstrip("\ufeff")
     candidates = []
     if "charset=" in resp.headers.get("Content-Type", "").lower():
         candidates.append(resp.encoding)
     meta = CHARSET_META.search(body[:4096])
     if meta:
-        candidates.append(meta.group(1).decode("ascii"))
+        name = meta.group(1).decode("ascii").lower()
+        candidates.append("utf-8" if name.startswith(("utf-16", "utf-32")) else name)
     for encoding in candidates + ["utf-8"]:
+        if not encoding:
+            continue
         try:
-            if encoding and codecs.lookup(encoding):
-                return body.decode(encoding, errors="replace")
-        except LookupError:
+            if not getattr(codecs.lookup(encoding), "_is_text_encoding", True):  # e.g. "idna", "base64"
+                continue
+            return body.decode(encoding, errors="replace")
+        except (LookupError, ValueError):  # unknown name, or a codec that can't decode text
             continue
     return body.decode("utf-8", errors="replace")
 
@@ -246,6 +256,11 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
     embeds = [_join(url, t.get("src") or t.get("action") or "")
               for t in soup.find_all(["iframe", "script", "form"])]
     iframes = [_join(url, t.get("src") or "") for t in soup.find_all("iframe")]
+    wrapper_iframes = [  # an iframe that could be holding the whole site, not a map/video/widget embed
+        src for src in iframes
+        if src.startswith("http") and src.rstrip("/") != url.rstrip("/") and not listing_host(src)
+        and not host_matches(src, EMBED_HOSTS + BOOKING_HOSTS)
+    ]
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
     text = soup.get_text(" ", strip=True)
@@ -260,7 +275,7 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
     if seconds > SLOW_SECONDS:
         issues.append(("slow", f"{seconds:.1f}s"))
 
-    if has_frames or (len(visible_text) < MIN_VISIBLE_TEXT and (has_scripts or iframes)):
+    if has_frames or (len(visible_text) < MIN_VISIBLE_TEXT and (has_scripts or wrapper_iframes)):
         how = "inside a frame" if has_frames or not has_scripts else "via JavaScript"
         info.append(f"partly checked: page content loads {how}, so booking, social, copyright and ad checks were skipped")
         return {"issues": issues, "info": info, "url": url}
@@ -281,14 +296,19 @@ def analyse_html(html, url, seconds, tls_error=False, today=None):
         issues.append(("no_booking", ""))
 
     years = []
-    for year, tail in COPYRIGHT_YEAR.findall(text):
+    for start, tail in COPYRIGHT_YEAR.findall(text):
+        year = int(start)
         two_digit_end = re.search(r"\d{2}$", tail)
-        if two_digit_end:
-            year = 2000 + int(two_digit_end.group())  # "© 2015-24"
-        elif tail:
-            year = today.year  # "© 2015-present"
-        if 1990 <= int(year) <= today.year + 1:
-            years.append(int(year))
+        if two_digit_end:  # "© 2015-24"; but not "© 2015 - 12 High Street"
+            end = year // 100 * 100 + int(two_digit_end.group())
+            if end < year:
+                end += 100
+            if end <= today.year + 1:
+                year = end
+        elif tail:  # "© 2015-present"
+            year = today.year
+        if 1990 <= year <= today.year + 1:
+            years.append(year)
     if years and max(years) < today.year - 2:
         issues.append(("old_copyright", str(max(years))))
 

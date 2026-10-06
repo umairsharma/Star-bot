@@ -30,11 +30,19 @@ GOOGLE_HOST = re.compile(r"(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$|\.google$")
 
 
 def host_of(url):
-    """Lower-case host name of a URL (scheme optional), or "" if it can't be parsed."""
+    """Lower-case ASCII host name of a URL (scheme optional), or "" if it can't be parsed.
+
+    Internationalised names are converted to punycode, so "zahnarzt-müller.de" and
+    "xn--zahnarzt-mller-psb.de" are the same host.
+    """
     try:
-        return (urlparse(url if "//" in url else "//" + url).hostname or "").rstrip(".")
+        host = (urlparse(url if "//" in url else "//" + url).hostname or "").rstrip(".")
     except ValueError:
         return ""
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return host.lower()
 
 
 def site_key(url):

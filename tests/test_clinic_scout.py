@@ -226,7 +226,7 @@ class BraveTests(unittest.TestCase):
 
 class FakeResponse:
     def __init__(self, status, text="", headers=None):
-        self.status_code, self.text = status, text
+        self.status_code, self.text, self.content = status, text, text.encode("utf-8")
         self.headers = headers or {}
         self.is_redirect = status in (301, 302, 303, 307, 308) and "Location" in self.headers
 
@@ -277,6 +277,9 @@ class FakeWeb:
         self.pages, self.requested = pages, []
 
     def get(self, url, **kwargs):
+        # The real session would follow redirects itself (skipping our listing-host checks),
+        # so every request must ask it not to.
+        assert kwargs.get("allow_redirects") is False, f"{url} fetched with automatic redirects"
         self.requested.append(url)
         if url.endswith("/robots.txt") and url not in self.pages:
             return FakeResponse(404)
@@ -450,8 +453,75 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_missing_output_folder_fails_before_the_run(self):
         from clinic_scout import cli
-        with self.assertRaises(SystemExit):
-            cli.parse_args(["--city", "Bath", "--country", "GB", "--output", "/no/such/folder/out.csv"])
+        for bad in ("/no/such/folder/out.csv", "/tmp", "/tmp/"):
+            with self.assertRaises(SystemExit, msg=bad):
+                cli.parse_args(["--city", "Bath", "--country", "GB", "--output", bad])
+
+
+class SecondReviewFixTests(unittest.TestCase):
+    """Regression tests for issues found when re-reviewing the first round of fixes."""
+
+    def test_robots_bom_bytes_without_charset_header(self):
+        robots_txt = FakeResponse(200, headers={"Content-Type": "text/plain"})
+        robots_txt.content = "\ufeffUser-agent: *\nDisallow: /\n".encode("utf-8")
+        robots = RobotsCache(FakeHttp(robots_txt))
+        self.assertFalse(robots.allowed("https://a.example/page"))
+
+    def test_robots_path_params_and_percent_encoding(self):
+        rules = parse_robots("User-agent: *\nDisallow: /*;jsessionid\nDisallow: /%7Ejoe/\nDisallow: /zahn%C3%A4rzte/\n")
+        self.assertFalse(robots_allows(rules, "https://s.example/index.jsp;jsessionid=ABC"))
+        self.assertFalse(robots_allows(rules, "https://s.example/~joe/x"))
+        self.assertFalse(robots_allows(rules, "https://s.example/zahnärzte/"))
+        self.assertTrue(robots_allows(rules, "https://s.example/"))
+
+    def test_idn_hosts_share_a_rate_limit(self):
+        self.assertEqual(site_key("https://zahnarzt-müller.de/"), site_key("https://www.xn--zahnarzt-mller-psb.de/"))
+        self.assertEqual(site_key("https://Clinic.Example/"), "clinic.example")
+
+    def test_finder_tries_www_after_bare_domain_error(self):
+        page = GOOD_SITE.replace("Smile Dental", "Smile Dental Bath")
+        web = FakeWeb({"https://www.smiledental.co.uk/": FakeSiteResponse(200, page)})  # bare domain: 404
+        from clinic_scout.website_finder import WebsiteFinder
+        finder = WebsiteFinder(web, RobotsCache(web), "gb")
+        finder.use_dns = False
+        clinic = {"name": "Smile Dental", "postcode": "", "phone": "", "street": ""}
+        self.assertEqual(finder.find(clinic, "Bath"), "https://www.smiledental.co.uk/")
+
+    def test_decode_body_bad_and_misleading_charsets(self):
+        html = FakeSiteResponse(200, headers={"Content-Type": "text/html"})
+        self.assertEqual(decode_body(b'<meta charset="undefined">ok', html)[-2:], "ok")
+        self.assertEqual(decode_body(b'<meta charset="idna">ok', html)[-2:], "ok")
+        self.assertEqual(decode_body('<meta charset="utf-16"><p>caf\u00e9</p>'.encode("utf-8"), html)[-8:],
+                         "caf\u00e9</p>")  # <meta> claiming UTF-16 means UTF-8
+
+    def test_copyright_tail_edge_cases(self):
+        def codes(footer):
+            html = WEAK_SITE.replace("Copyright 2019 Old Surgery", footer)
+            return [c for c, _ in analyse_html(html, "https://x.example/", 0.5, today=TODAY)["issues"]]
+        self.assertIn("old_copyright", codes("© 2015 - 12 High Street"))  # not a year range
+        self.assertIn("old_copyright", codes("© 2015-presentation slides"))  # not "present"
+        self.assertNotIn("old_copyright", codes("© 2015 - present"))
+
+    def test_map_embed_does_not_make_a_page_framed(self):
+        html = ('<html><body><p>Smile Dental</p><a href="tel:01225">Call</a>'
+                '<iframe src="https://www.google.com/maps/embed?pb=x"></iframe></body></html>')
+        result = analyse_html(html, "https://x.example/", 0.5, today=TODAY)
+        self.assertFalse(any(i.startswith("partly checked") for i in result["info"]))
+
+    def test_numeric_postcode_alone_when_city_has_no_latin_letters(self):
+        clinic = {"name": "歯科", "postcode": "1500001", "phone": "", "street": ""}
+        self.assertTrue(page_matches("東京都渋谷区 〒150-0001 1500001", clinic, "東京"))
+
+    def test_brave_skips_unmatchable_names_without_a_query(self):
+        from clinic_scout.brave import BraveLookup
+
+        class NoCalls:
+            def get(self, *a, **k):
+                raise AssertionError("no API call expected")
+
+        brave = BraveLookup(NoCalls())
+        brave.enabled, brave.key = True, "test-key"
+        self.assertEqual(brave.find_website("東京歯科", "Tokyo"), (None, False))
 
 
 if __name__ == "__main__":

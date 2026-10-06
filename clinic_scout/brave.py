@@ -30,8 +30,8 @@ class BraveLookup:
 
         Disables itself on an auth or quota error.
         """
-        if not self.enabled:
-            return None, False
+        if not self.enabled or not match_words(name, city):
+            return None, False  # nothing we could match results against, so don't spend a query
         try:
             resp = self.http.get(
                 SEARCH_URL,
@@ -57,19 +57,25 @@ def _registered_host(url):
     return host[4:] if host.startswith("www.") else host
 
 
+def match_words(name, city=""):
+    """Distinctive words of the clinic's name to look for in result domains ([] if none)."""
+    city_words = set(ascii_words(city))
+    words = [w for w in ascii_words(name) if len(w) >= 4 and w not in GENERIC_WORDS and w not in city_words]
+    if words:
+        return words
+    squashed = "".join(ascii_words(name))  # e.g. "The Medical Centre" -> "themedicalcentre"
+    return [squashed] if len(squashed) >= 4 else []  # [] for names written only in non-Latin script
+
+
 def pick_own_site(name, urls, city=""):
     """Pick the first result whose domain contains a distinctive word of the clinic's name.
 
     Listing/directory sites and the city's own words don't count. The caller still
     verifies the page (postcode, phone, or name plus city) before trusting it.
     """
-    city_words = set(ascii_words(city))
-    words = [w for w in ascii_words(name) if len(w) >= 4 and w not in GENERIC_WORDS and w not in city_words]
-    if not words:  # e.g. "The Medical Centre": fall back to the whole name squashed together
-        squashed = "".join(ascii_words(name))
-        if len(squashed) < 4:  # e.g. a name written only in non-Latin script
-            return None
-        words = [squashed]
+    words = match_words(name, city)
+    if not words:
+        return None
     for url in urls:
         try:
             host = _registered_host(url)
