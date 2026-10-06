@@ -1,8 +1,9 @@
-"""Polite HTTP: descriptive User-Agent, timeouts, retries, and rate limits."""
+"""Polite HTTP: descriptive User-Agent, timeouts, retries, rate limits, robots.txt."""
 
 import os
 import time
 from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 
@@ -11,6 +12,7 @@ from clinic_scout import __version__
 PER_DOMAIN_DELAY = 1.0  # seconds between requests to the same domain
 GLOBAL_DELAY = 0.3  # seconds between any two requests
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+ROBOTS_AGENT = "clinic-scout"
 
 
 def user_agent():
@@ -20,10 +22,9 @@ def user_agent():
 
 
 class PoliteSession:
-    def __init__(self, retries=3):
+    def __init__(self):
         self.session = requests.Session()
         self.session.headers["User-Agent"] = user_agent()
-        self.retries = retries
         self._last_by_domain = {}
         self._last_any = 0.0
 
@@ -40,24 +41,28 @@ class PoliteSession:
         self._last_any = stamp
         self._last_by_domain[domain] = stamp
 
-    def request(self, method, url, timeout=10, retry=True, **kwargs):
+    def request(self, method, url, timeout=10, attempts=1, **kwargs):
         """Send a request, retrying on network errors and 429/5xx with backoff.
 
+        `resp.started_at` is the monotonic time the request was sent (after any
+        rate-limit wait), so callers can time the response themselves.
         Raises the last exception if every attempt fails.
         """
-        attempts = self.retries + 1 if retry else 1
         last_error = None
         for attempt in range(attempts):
             self._wait(url)
+            started_at = time.monotonic()
             try:
                 resp = self.session.request(method, url, timeout=timeout, **kwargs)
             except requests.RequestException as exc:
                 last_error = exc
             else:
+                resp.started_at = started_at
                 if resp.status_code not in RETRY_STATUSES or attempt == attempts - 1:
                     return resp
                 last_error = requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
                 retry_after = resp.headers.get("Retry-After", "")
+                resp.close()
                 if retry_after.isdigit():
                     time.sleep(min(int(retry_after), 60))
                     continue
@@ -70,3 +75,31 @@ class PoliteSession:
 
     def post(self, url, **kwargs):
         return self.request("POST", url, **kwargs)
+
+
+class RobotsCache:
+    """Fetches and caches robots.txt per site, following RFC 9309.
+
+    4xx (no robots.txt) means everything is allowed; 5xx means nothing is.
+    Network errors propagate so the caller can treat the site as unreachable.
+    """
+
+    def __init__(self, http):
+        self.http = http
+        self._parsers = {}
+
+    def allowed(self, url):
+        parts = urlparse(url)
+        root = f"{parts.scheme}://{parts.netloc}"
+        parser = self._parsers.get(root)
+        if parser is None:
+            parser = RobotFileParser()
+            resp = self.http.get(root + "/robots.txt", timeout=10)
+            if resp.status_code >= 500:
+                parser.disallow_all = True
+            elif resp.status_code >= 400:
+                parser.allow_all = True
+            else:
+                parser.parse(resp.text.splitlines())
+            self._parsers[root] = parser
+        return parser.can_fetch(ROBOTS_AGENT, url)
