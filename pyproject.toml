@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinic-scout"
+version = "0.1.0"
+description = "Find clinics in a city that likely need marketing help, using free data only."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+clinic-scout = "clinic_scout.cli:main"
+
+[tool.setuptools]
+packages = ["clinic_scout"]
