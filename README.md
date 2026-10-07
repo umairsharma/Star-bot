@@ -32,7 +32,7 @@ clinic-scout --city Bath --country "United Kingdom" --limit 20
 | `--radius-km` | `5` | Search radius if the city has no boundary on the map |
 | `--output` | `results.csv` | Output file |
 | `--refresh` | off | Ignore cached OpenStreetMap results (Nominatim and Overpass, cached for 24 h in `.cache/`) |
-| `--include-public` | off | Keep public NHS/hospital units (skipped by default) |
+| `--include-public` | off | Keep public and hospital units (skipped by default) |
 
 Output: `results.csv` with `name, phone, address, website, score, issues, note`,
 plus a summary table in the terminal.
@@ -57,9 +57,12 @@ repos; private repos on the Free plan get a monthly allowance of free minutes.
    from Overpass (`amenity=` and the newer `healthcare=` tags). If every Overpass
    server is down it falls back to a Nominatim search. Unnamed entries are skipped
    and the same clinic mapped twice (point + building) is merged.
-2. **Pick which clinics to check.** Public NHS/hospital units are skipped (by name,
-   operator, or hospital-only speciality). Then up to `--limit` clinics are checked,
-   those with their own website first, since their results are the most reliable.
+2. **Pick which clinics to check.** Public and hospital units are skipped: names with
+   Hospital/NHS/Infirmary, hospital or government-run entries, and university clinics.
+   In the UK, NHS walk-in centres, NHS trusts and hospital-only specialities are skipped
+   too (elsewhere, e.g. the US, those are often private businesses, so they're kept).
+   Then up to `--limit` clinics are checked, those with their own website first,
+   since their results are the most reliable.
 3. **Find missing websites for free.** For clinics with no website on the map (or
    only a listing page), likely domains are guessed from the name
    (`ashleydowndentalcare.co.uk`, `ashleydowndental.co.uk`, …). Each guess gets a

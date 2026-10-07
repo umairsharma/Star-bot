@@ -33,7 +33,7 @@ def parse_args(argv=None):
     p.add_argument("--output", default="results.csv", help="CSV path (default: %(default)s)")
     p.add_argument("--refresh", action="store_true", help="ignore cached OpenStreetMap results")
     p.add_argument("--include-public", action="store_true",
-                   help="keep public NHS/hospital units (skipped by default: not marketing prospects)")
+                   help="keep public and hospital units (skipped by default: not marketing prospects)")
     args = p.parse_args(argv)
     args.types = [t.strip().lower() for t in args.types.split(",") if t.strip()]
     if not args.types or not all(re.fullmatch(r"[a-z_]+", t) for t in args.types):
@@ -78,13 +78,13 @@ def find_clinics(http, args):
         print(f"{exc}\nFalling back to Nominatim search (fewer results, max 120 per type).")
         data = nominatim.search_clinics(http, city, args.types, limit=10_000, refresh=args.refresh)
         source = "Nominatim"
-    clinics = overpass.parse_elements(data)
+    clinics = overpass.parse_elements(data, city["country_code"])
     print(f"Found {len(clinics)} named clinics via {source} "
           f"({sum(1 for c in clinics if c['website'])} with a website on the map).")
     public = [c for c in clinics if c["public"]]
     if public and not args.include_public:
         clinics = [c for c in clinics if not c["public"]]
-        print(f"Skipped {len(public)} public NHS/hospital units (use --include-public to keep them).")
+        print(f"Skipped {len(public)} public or hospital units (use --include-public to keep them).")
     if len(clinics) > args.limit:
         print(f"Checking {args.limit} of {len(clinics)}, clinics with their own website first.")
     return sorted(clinics, key=_check_order)[: args.limit], city

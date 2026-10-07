@@ -96,13 +96,28 @@ class OverpassTests(unittest.TestCase):
         self.assertIn("around:5000,51.38,-2.36", overpass.build_query(node, ["dentist"], 5000))
 
     def test_public_units(self):
-        self.assertTrue(overpass.is_public_unit({"name": "Bristol City Gate NHS walk-in centre"}))
-        self.assertTrue(overpass.is_public_unit({"name": "Bristol Eye Hospital Assessment Clinic"}))
+        gb = "gb"
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol City Gate NHS walk-in centre"}, gb))
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol Eye Hospital Assessment Clinic"}, gb))
         self.assertTrue(overpass.is_public_unit({"name": "Petherton Resource Centre",
-                                                 "operator": "Avon and Wiltshire Mental Health Partnership NHS Trust"}))
-        self.assertTrue(overpass.is_public_unit({"name": "Breast Care Centre", "healthcare:speciality": "oncology"}))
-        self.assertFalse(overpass.is_public_unit({"name": "Prime Endoscopy Bristol", "healthcare:speciality": "endoscopy"}))
-        self.assertFalse(overpass.is_public_unit({"name": "Circus Dental", "operator": "Bupa"}))
+                                                 "operator": "Avon and Wiltshire Mental Health Partnership NHS Trust"}, gb))
+        self.assertTrue(overpass.is_public_unit({"name": "Breast Care Centre", "healthcare:speciality": "oncology"}, gb))
+        self.assertFalse(overpass.is_public_unit({"name": "Prime Endoscopy Bristol", "healthcare:speciality": "endoscopy"}, gb))
+        self.assertFalse(overpass.is_public_unit({"name": "Circus Dental", "operator": "Bupa"}, gb))
+
+    def test_public_units_outside_the_uk(self):
+        # In the US, freestanding ERs, urgent care and oncology clinics are private businesses.
+        for tags in ({"name": "Frontline ER", "healthcare:speciality": "emergency"},
+                     {"name": "ER of Dallas - Emergency Room", "building": "hospital", "healthcare:speciality": "emergency"},
+                     {"name": "Citra Urgent Care", "healthcare:speciality": "emergency"},
+                     {"name": "Texas Imaging & Infusion Center", "operator": "Texas Oncology",
+                      "healthcare:speciality": "oncology"},
+                     {"name": "MinuteClinic walk-in clinic"}):
+            self.assertFalse(overpass.is_public_unit(tags, "us"), tags["name"])
+        for tags in ({"name": "Moody Outpatient Center at Parkland Hospital"},
+                     {"name": "Cancer Care Outpatient Building", "operator": "University of Texas Southwestern"},
+                     {"name": "County Clinic", "operator:type": "government"}):
+            self.assertTrue(overpass.is_public_unit(tags, "us"), tags["name"])
 
     def test_parse_skips_unnamed_and_merges_nearby_duplicates(self):
         data = {"elements": [
