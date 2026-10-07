@@ -43,7 +43,8 @@ The repo includes a GitHub Actions workflow, so GitHub's servers can run it for 
 
 1. Open the repo on github.com in your phone's browser and tap the **Actions** tab.
 2. Choose **Run clinic-scout**, then **Run workflow**.
-3. Enter the city and country (and optionally limit/top), then tap **Run workflow**.
+3. Enter the city and country (and optionally a state/region, limit and top), then tap
+   **Run workflow**.
 4. When the run finishes (about 15 minutes for 100 clinics), open it: the results
    table is on the run's summary page, and `results.csv` is under **Artifacts**.
 

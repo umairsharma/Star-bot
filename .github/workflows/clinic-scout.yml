@@ -14,6 +14,11 @@ on:
         required: true
         default: "GB"
         type: string
+      region:
+        description: "State/county, if the city name exists in several places (e.g. Texas). Optional."
+        required: false
+        default: ""
+        type: string
       limit:
         description: "Max clinics to check (100 takes about 15 minutes)"
         required: true
@@ -52,13 +57,14 @@ jobs:
           # Inputs go through env vars, never straight into the shell command.
           CITY: ${{ inputs.city }}
           COUNTRY: ${{ inputs.country }}
+          REGION: ${{ inputs.region }}
           LIMIT: ${{ inputs.limit }}
           TOP: ${{ inputs.top }}
           TYPES: ${{ inputs.types }}
           BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}  # optional repository secret
         run: |
-          clinic-scout --city "$CITY" --country "$COUNTRY" --limit "$LIMIT" --top "$TOP" \
-            --types "$TYPES" --output results.csv
+          clinic-scout --city "$CITY" --country "$COUNTRY" ${REGION:+--region "$REGION"} \
+            --limit "$LIMIT" --top "$TOP" --types "$TYPES" --output results.csv
 
       - name: Show results on the run page
         if: always() && hashFiles('results.csv') != ''
