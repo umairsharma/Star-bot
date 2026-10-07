@@ -37,6 +37,20 @@ clinic-scout --city Bath --country "United Kingdom" --limit 20
 Output: `results.csv` with `name, phone, address, website, score, issues, note`,
 plus a summary table in the terminal.
 
+## Run it from your phone (no computer needed)
+
+The repo includes a GitHub Actions workflow, so GitHub's servers can run it for free:
+
+1. Open the repo on github.com in your phone's browser and tap the **Actions** tab.
+2. Choose **Run clinic-scout**, then **Run workflow**.
+3. Enter the city and country (and optionally limit/top), then tap **Run workflow**.
+4. When the run finishes (about 15 minutes for 100 clinics), open it: the results
+   table is on the run's summary page, and `results.csv` is under **Artifacts**.
+
+To enable the optional Brave check there, add `BRAVE_API_KEY` as a repository secret
+(Settings → Secrets and variables → Actions). GitHub Actions is free for public
+repos; private repos on the Free plan get a monthly allowance of free minutes.
+
 ## How it works
 
 1. **Find the city** with Nominatim, then fetch **every clinic** inside its boundary

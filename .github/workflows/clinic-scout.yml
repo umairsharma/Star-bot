@@ -1,0 +1,75 @@
+name: Run clinic-scout
+
+# Run from github.com (works in a phone browser): Actions tab -> "Run clinic-scout" -> "Run workflow".
+# Results appear as a table on the run's summary page, and results.csv is under "Artifacts".
+on:
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "City (e.g. Bristol)"
+        required: true
+        type: string
+      country:
+        description: "Country name or 2-letter code (e.g. GB, US)"
+        required: true
+        default: "GB"
+        type: string
+      limit:
+        description: "Max clinics to check (100 takes about 15 minutes)"
+        required: true
+        default: "100"
+        type: string
+      top:
+        description: "Rows to keep in the results"
+        required: true
+        default: "15"
+        type: string
+      types:
+        description: "OpenStreetMap types to search"
+        required: true
+        default: "clinic,doctors,dentist"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install clinic-scout
+        run: pip install -e .
+
+      - name: Find and score clinics
+        env:
+          # Inputs go through env vars, never straight into the shell command.
+          CITY: ${{ inputs.city }}
+          COUNTRY: ${{ inputs.country }}
+          LIMIT: ${{ inputs.limit }}
+          TOP: ${{ inputs.top }}
+          TYPES: ${{ inputs.types }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}  # optional repository secret
+        run: |
+          clinic-scout --city "$CITY" --country "$COUNTRY" --limit "$LIMIT" --top "$TOP" \
+            --types "$TYPES" --output results.csv
+
+      - name: Show results on the run page
+        if: always() && hashFiles('results.csv') != ''
+        env:
+          CITY: ${{ inputs.city }}
+        run: python .github/scripts/results_summary.py results.csv >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save results.csv
+        if: always() && hashFiles('results.csv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: clinic-scout-results
+          path: results.csv
+          retention-days: 30
