@@ -7,7 +7,7 @@ import re
 import requests
 
 from clinic_scout import cache
-from clinic_scout.hosts import listing_host, social_profile
+from clinic_scout.hosts import SOCIAL_NETWORKS, clean_emails, host_matches, listing_host, social_profile
 
 DEFAULT_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -108,7 +108,7 @@ SOCIAL_TAGS = {
     "X": (("contact:twitter", "twitter", "contact:x"), "https://x.com/"),
     "LinkedIn": (("contact:linkedin", "linkedin"), "https://www.linkedin.com/company/"),
     "TikTok": (("contact:tiktok", "tiktok"), "https://www.tiktok.com/@"),
-    "YouTube": (("contact:youtube", "youtube"), "https://www.youtube.com/"),
+    "YouTube": (("contact:youtube", "youtube"), "https://www.youtube.com/@"),
 }
 
 
@@ -118,21 +118,24 @@ def _website_values(tags):
 
 
 def _emails(tags):
-    raw = tags.get("email") or tags.get("contact:email") or ""
-    return [e.strip() for e in raw.split(";") if "@" in e][:3]
+    return clean_emails([tags.get("email") or tags.get("contact:email") or ""])
 
 
 def _socials(tags):
     """Social accounts from OSM tags (and a website tag that points at a social page)."""
     found = {}
+    hosts = dict(SOCIAL_NETWORKS)
     for network, (keys, base) in SOCIAL_TAGS.items():
         value = next((tags[k] for k in keys if tags.get(k)), "").split(";")[0].strip()
-        if not value:
+        if not value or re.search(r"\s", value):  # handles never contain spaces
             continue
         if not re.match(r"^https?://", value, re.I):
-            value = value.lstrip("@")
-            value = "https://" + value if "." in value.split("/")[0] else base + value
-        found[network] = value
+            # "facebook.com/smile" is a URL without its scheme; "smile.dental" or "@smile" is a handle.
+            as_url = "https://" + value
+            value = as_url if host_matches(as_url, hosts[network]) else base + value.lstrip("@")
+        profile = social_profile(value)
+        if profile and profile[0] == network:
+            found[network] = profile[1]
     for value in _website_values(tags):
         profile = social_profile(value if "//" in value else "https://" + value)
         if profile and profile[0] not in found:
@@ -148,7 +151,8 @@ def _website(tags):
 
 def _listing_url(tags):
     """A directory/social page the map links to as the clinic's website (e.g. an nhs.uk page)."""
-    return next((v for v in _website_values(tags) if listing_host(v)), "")
+    url = next((v for v in _website_values(tags) if listing_host(v)), "")
+    return url if not url or re.match(r"^https?://", url, re.I) else "https://" + url
 
 
 def _distance_m(a, b):

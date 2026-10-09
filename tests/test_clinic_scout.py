@@ -543,6 +543,8 @@ class ContactTests(unittest.TestCase):
     def test_emails_and_socials_from_homepage(self):
         hidden = "".join(f"{b ^ 0x42:02x}" for b in b"info@smile.example")
         html = GOOD_SITE.replace("</body>", f"""
+            logo@2x.png <a href="https://www.linkedin.com/sharing/share-offsite/?url=x">Share</a>
+            <a href="https://www.linkedin.com/company/smile-dental/">LinkedIn</a>
             <a href="mailto:Bookings@Smile.example?subject=Hi">Email</a>
             <span class="__cf_email__" data-cfemail="42{hidden}">[email protected]</span>
             reception@smile.example logo@2x.png
@@ -551,7 +553,8 @@ class ContactTests(unittest.TestCase):
         result = analyse_html(html, "https://smile.example/", 0.5, today=TODAY)
         self.assertEqual(result["emails"], ["Bookings@Smile.example", "info@smile.example", "reception@smile.example"])
         self.assertEqual(result["socials"], {"Facebook": "https://www.facebook.com/smiledental",
-                                             "Instagram": "https://instagram.com/smile_dental"})
+                                             "Instagram": "https://instagram.com/smile_dental",
+                                             "LinkedIn": "https://www.linkedin.com/company/smile-dental"})
 
     def test_contacts_from_map_tags(self):
         data = {"elements": [{"type": "node", "id": 42, "lat": 1, "lon": 1, "tags": {
@@ -660,6 +663,111 @@ class DiscordTests(unittest.TestCase):
         self.assertTrue(is_webhook_url("https://ptb.discordapp.com/api/webhooks/123/x"))
         self.assertFalse(is_webhook_url("https://evil.example/api/webhooks/123/x"))
         self.assertFalse(is_webhook_url(""))
+
+
+class DiscordReviewFixTests(unittest.TestCase):
+    """Regression tests for issues found when reviewing the Discord lead cards."""
+
+    BASE = dict(score=10, phone="+7 495 000 00 00", emails=["hi@x.example"], website="https://x.example/",
+                issues="website down (timed out)", note="Their website is broken (timed out).",
+                socials={"Instagram": "https://www.instagram.com/x"}, osm_url="https://www.openstreetmap.org/node/1",
+                listing_url="")
+
+    def card(self, city="Guildford, England, United Kingdom", **over):
+        from clinic_scout.discord import build_card
+        return build_card(1, {**self.BASE, **over}, city)
+
+    def assert_valid(self, card):
+        from clinic_scout import discord
+        self.assertLessEqual(discord._size(card), 6000)
+        self.assertLessEqual(len(card["description"]), 4096)
+        self.assertTrue(all(f["value"] and len(f["value"]) <= 1024 for f in card["fields"]))
+        self.assertRegex(card["description"], r"\(https://wa\.me/\?text=[^)\s]+\)$")
+
+    def lookup(self, card):
+        return next(f["value"] for f in card["fields"] if f["name"] == "Look them up")
+
+    def test_non_latin_leads_keep_both_lookup_links_and_fit(self):
+        for name, address, city in (
+            ("คลินิกทันตกรรมสไมล์ เดนทัล สาขาสุขุมวิท",
+             "123/45 ถนนสุขุมวิท ซอยสุขุมวิท 21 แขวงคลองเตยเหนือ เขตวัฒนา กรุงเทพมหานคร 10110", "กรุงเทพมหานคร, ประเทศไทย"),
+            ("Стоматологическая поликлиника «Центр Современной Стоматологии»", "15 Ленинградский проспект, 125040 Москва",
+             "Москва, Центральный федеральный округ, Россия"),
+            ("Стоматологическая клиника «Дентал Студио»", "", "Москва, Центральный федеральный округ, Россия"),
+        ):
+            card = self.card(city=city, name=name, address=address)
+            self.assert_valid(card)
+            self.assertIn("Search on Google", self.lookup(card))
+            self.assertIn("Open in Google Maps", self.lookup(card))
+
+    def test_lookup_adds_the_town_when_the_address_lacks_it(self):
+        card = self.card(name="Smile Dental", address="12 High Street")
+        self.assertIn("query=Smile+Dental+12+High+Street+Guildford%2C+England", self.lookup(card))
+        card = self.card(name="Smile Dental", address="12 High Street, GU1 1AA Guildford")
+        self.assertNotIn("England", self.lookup(card))
+
+    def test_malformed_links_are_fixed_or_dropped(self):
+        card = self.card(name="Smile", address="1 Main St", website="http://bad site .com/a b",
+                         listing_url="www.yelp.com/biz/smile")
+        self.assert_valid(card)
+        self.assertNotIn("url", card)  # Discord rejects malformed embed URLs
+        listed = next(f["value"] for f in card["fields"] if f["name"] == "Where they're listed")
+        self.assertIn("[yelp.com page](https://www.yelp.com/biz/smile)", listed)
+
+    def test_safe_url(self):
+        from clinic_scout.discord import safe_url
+        self.assertEqual(safe_url("www.yelp.com/biz/smile"), "https://www.yelp.com/biz/smile")
+        self.assertEqual(safe_url("https://zahnarzt-müller.de/praxis (neu)"),
+                         "https://xn--zahnarzt-mller-psb.de/praxis%20%28neu%29")
+        for bad in ("http://bad site .com/", "javascript:alert(1)", "https://localhost/x", ""):
+            self.assertEqual(safe_url(bad), "", bad)
+
+    def test_huge_lead_still_fits(self):
+        self.assert_valid(self.card(name="N" * 400, address="A" * 2000, note="x" * 5000,
+                                    issues="; ".join(["no HTTPS"] * 400)))
+
+
+class SocialProfileTests(unittest.TestCase):
+    def test_profiles_and_non_profiles(self):
+        from clinic_scout.hosts import social_profile
+        expected = {
+            "https://www.facebook.com/home-dental-care": ("Facebook", "https://www.facebook.com/home-dental-care"),
+            "https://www.linkedin.com/company/smile-dental/about": ("LinkedIn", "https://www.linkedin.com/company/smile-dental"),
+            "https://www.facebook.com/v2.12/plugins/page.php?href=https%3A%2F%2Fwww.facebook.com%2Fsmiledental":
+                ("Facebook", "https://www.facebook.com/smiledental"),
+            "https://x.com/smiledental/status/123": ("X", "https://x.com/smiledental"),
+            "https://www.tiktok.com/@smile/video/1": ("TikTok", "https://www.tiktok.com/@smile"),
+            "https://www.facebook.com/profile.php?id=100064": ("Facebook", "https://www.facebook.com/profile.php?id=100064"),
+            "https://www.youtube.com/channel/UC123/videos": ("YouTube", "https://www.youtube.com/channel/UC123"),
+        }
+        for url, profile in expected.items():
+            self.assertEqual(social_profile(url), profile, url)
+        for url in ("https://www.linkedin.com/shareArticle?mini=true&url=x", "https://www.linkedin.com/sharing/share-offsite/?url=x",
+                    "https://www.instagram.com/p/Cx123/", "https://www.youtube.com/watch?v=1", "https://twitter.com/intent/tweet",
+                    "https://www.facebook.com/sharer/sharer.php?u=x", "https://www.facebook.com/tr?id=1", "https://www.facebook.com/"):
+            self.assertIsNone(social_profile(url), url)
+
+    def test_osm_social_handles_and_emails(self):
+        tags = {"amenity": "dentist", "name": "Smile", "email": "mailto:Hi@Smile.example, hi@smile.example",
+                "instagram": "smile.dental", "contact:facebook": "Smile Dental Clinic", "youtube": "@smilechan",
+                "contact:tiktok": "tiktok.com/@smile", "website": "www.yelp.com/biz/smile"}
+        clinic = overpass.parse_elements({"elements": [{"type": "node", "id": 1, "lat": 1, "lon": 1, "tags": tags}]})[0]
+        self.assertEqual(clinic["emails"], ["Hi@Smile.example"])
+        self.assertEqual(clinic["socials"], {"Instagram": "https://www.instagram.com/smile.dental",
+                                             "TikTok": "https://tiktok.com/@smile",
+                                             "YouTube": "https://www.youtube.com/@smilechan"})
+        self.assertEqual(clinic["listing_url"], "https://www.yelp.com/biz/smile")
+
+    def test_map_socials_win_and_emails_merge_case_insensitively(self):
+        from clinic_scout import cli
+        pages = {"https://clinic.example/": FakeSiteResponse(200, GOOD_SITE.replace(
+            "</body>", '<a href="mailto:HI@x.example">m</a><a href="https://www.facebook.com/someone-else">f</a></body>'))}
+        clinic = {"name": "Smile Dental", "website": "https://clinic.example/", "phone": "", "postcode": "",
+                  "emails": ["hi@x.example"], "socials": {"Facebook": "https://www.facebook.com/smile"}}
+        web = FakeWeb(pages)
+        cli.assess(web, RobotsCache(web), AssessTests.Finder(None), AssessTests.NoBrave(), clinic, "Bath")
+        self.assertEqual(clinic["emails"], ["hi@x.example"])
+        self.assertEqual(clinic["socials"]["Facebook"], "https://www.facebook.com/smile")
 
 
 if __name__ == "__main__":

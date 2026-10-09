@@ -13,7 +13,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from clinic_scout.hosts import host_matches, listing_host, social_profile
+from clinic_scout.hosts import EMAIL, clean_emails, host_matches, listing_host, social_profile
 from clinic_scout.http_client import MAX_REDIRECTS, redirect_target
 
 TIMEOUT = 10
@@ -46,13 +46,6 @@ COPYRIGHT_YEAR = re.compile(
 # Iframes that are embeds (maps, video, widgets), not a frame wrapping the whole site.
 EMBED_HOSTS = ("youtube-nocookie.com", "vimeo.com", "googleusercontent.com", "gstatic.com", "doubleclick.net")
 BOMS = ((codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"))
-EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}\b")
-# Things that look like emails but aren't contact addresses (image names, tracking, placeholders).
-JUNK_EMAIL = re.compile(
-    r"\.(png|jpe?g|gif|webp|svg|css|js)$|@(example\.|sentry|wixpress\.com|domain\.com|email\.com|yourdomain)",
-    re.I,
-)
-MAX_EMAILS = 3
 CHARSET_META = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([a-zA-Z0-9_.:-]+)""", re.I)
 PARKED_WORDS = re.compile(
     r"domain (is|may be) for sale|buy this domain|this domain is parked|parked free|"
@@ -139,17 +132,13 @@ def extract_contacts(soup, hrefs, embeds, text):
             candidates.append(_cloudflare_email(link.split("#", 1)[1]))
     candidates += [_cloudflare_email(tag["data-cfemail"]) for tag in soup.find_all(attrs={"data-cfemail": True})]
     candidates += EMAIL.findall(text)
-    emails, seen = [], set()
-    for email in (c.strip() for c in candidates):
-        if EMAIL.fullmatch(email) and not JUNK_EMAIL.search(email) and email.lower() not in seen:
-            seen.add(email.lower())
-            emails.append(email)
+    emails = clean_emails(candidates)
     socials = {}
     for link in hrefs + embeds:
         profile = social_profile(link) if link else None
         if profile and profile[0] not in socials:
             socials[profile[0]] = profile[1]
-    return emails[:MAX_EMAILS], socials
+    return emails, socials
 
 
 def _meta_refresh_target(body, url):
