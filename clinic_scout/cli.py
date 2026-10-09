@@ -8,7 +8,7 @@ import sys
 import requests
 from dotenv import load_dotenv
 
-from clinic_scout import nominatim, output, overpass, scoring
+from clinic_scout import discord, nominatim, output, overpass, scoring
 from clinic_scout.brave import BraveLookup
 from clinic_scout.http_client import PoliteSession, RobotsCache
 from clinic_scout.hosts import listing_host
@@ -32,8 +32,10 @@ def parse_args(argv=None):
                    help="search radius if the city has no boundary on the map (default: %(default)s)")
     p.add_argument("--output", default="results.csv", help="CSV path (default: %(default)s)")
     p.add_argument("--refresh", action="store_true", help="ignore cached OpenStreetMap results")
+    p.add_argument("--no-discord", action="store_true",
+                   help="don't post lead cards to Discord even if DISCORD_WEBHOOK_URL is set")
     p.add_argument("--include-public", action="store_true",
-                   help="keep public NHS/hospital units (skipped by default: not marketing prospects)")
+                   help="keep public and hospital units (skipped by default: not marketing prospects)")
     args = p.parse_args(argv)
     args.types = [t.strip().lower() for t in args.types.split(",") if t.strip()]
     if not args.types or not all(re.fullmatch(r"[a-z_]+", t) for t in args.types):
@@ -78,13 +80,13 @@ def find_clinics(http, args):
         print(f"{exc}\nFalling back to Nominatim search (fewer results, max 120 per type).")
         data = nominatim.search_clinics(http, city, args.types, limit=10_000, refresh=args.refresh)
         source = "Nominatim"
-    clinics = overpass.parse_elements(data)
+    clinics = overpass.parse_elements(data, city["country_code"])
     print(f"Found {len(clinics)} named clinics via {source} "
           f"({sum(1 for c in clinics if c['website'])} with a website on the map).")
     public = [c for c in clinics if c["public"]]
     if public and not args.include_public:
         clinics = [c for c in clinics if not c["public"]]
-        print(f"Skipped {len(public)} public NHS/hospital units (use --include-public to keep them).")
+        print(f"Skipped {len(public)} public or hospital units (use --include-public to keep them).")
     if len(clinics) > args.limit:
         print(f"Checking {args.limit} of {len(clinics)}, clinics with their own website first.")
     return sorted(clinics, key=_check_order)[: args.limit], city
@@ -125,6 +127,9 @@ def assess(http, robots, finder, brave, clinic, city_name):
             clinic["website"] = found
             result = check_website(http, robots, found)
     info += result["info"]
+    # Contacts published on their own site, added to any from the map.
+    clinic["emails"] = list(dict.fromkeys(clinic.get("emails", []) + result.get("emails", [])))[:3]
+    clinic["socials"] = {**clinic.get("socials", {}), **result.get("socials", {})}
     if any("checked the homepage instead" in i for i in info):
         clinic["website"] = result["url"]
     if not clinic["phone"] and result.get("phone"):
@@ -133,6 +138,8 @@ def assess(http, robots, finder, brave, clinic, city_name):
 
 
 def _finish(clinic, issues, info):
+    for key, empty in (("emails", []), ("socials", {}), ("listing_url", ""), ("osm_url", "")):
+        clinic.setdefault(key, empty)
     clinic["score"] = scoring.score(issues)
     clinic["issues"] = scoring.issues_text(issues, info)
     clinic["note"] = scoring.note(issues, info)
@@ -184,3 +191,24 @@ def main(argv=None):
               f"{scoring.WEIGHTS['no_website_unverified']} (unverified), so sites with bigger confirmed "
               f"problems rank above them.{hint}")
     print(f"\n{output.ATTRIBUTION}")
+    post_to_discord(http, args, rows, city, len(clinics))
+
+
+def _city_label(city):
+    """"Dallas, Dallas County, Texas, United States" -> "Dallas, Texas, United States"."""
+    parts = city["display_name"].split(", ")
+    return ", ".join(dict.fromkeys([parts[0]] + parts[-2:]))
+
+
+def post_to_discord(http, args, rows, city, checked):
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if args.no_discord:
+        return
+    if not webhook:
+        print("Discord: off (add DISCORD_WEBHOOK_URL to .env to post one card per lead).")
+        return
+    if not discord.is_webhook_url(webhook):
+        print("Discord: DISCORD_WEBHOOK_URL doesn't look like a Discord webhook URL; nothing posted.")
+        return
+    posted = discord.post_leads(http, webhook, rows, _city_label(city), checked)
+    print(f"Discord: posted {posted} of {len(rows)} lead cards.")

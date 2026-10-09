@@ -96,13 +96,28 @@ class OverpassTests(unittest.TestCase):
         self.assertIn("around:5000,51.38,-2.36", overpass.build_query(node, ["dentist"], 5000))
 
     def test_public_units(self):
-        self.assertTrue(overpass.is_public_unit({"name": "Bristol City Gate NHS walk-in centre"}))
-        self.assertTrue(overpass.is_public_unit({"name": "Bristol Eye Hospital Assessment Clinic"}))
+        gb = "gb"
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol City Gate NHS walk-in centre"}, gb))
+        self.assertTrue(overpass.is_public_unit({"name": "Bristol Eye Hospital Assessment Clinic"}, gb))
         self.assertTrue(overpass.is_public_unit({"name": "Petherton Resource Centre",
-                                                 "operator": "Avon and Wiltshire Mental Health Partnership NHS Trust"}))
-        self.assertTrue(overpass.is_public_unit({"name": "Breast Care Centre", "healthcare:speciality": "oncology"}))
-        self.assertFalse(overpass.is_public_unit({"name": "Prime Endoscopy Bristol", "healthcare:speciality": "endoscopy"}))
-        self.assertFalse(overpass.is_public_unit({"name": "Circus Dental", "operator": "Bupa"}))
+                                                 "operator": "Avon and Wiltshire Mental Health Partnership NHS Trust"}, gb))
+        self.assertTrue(overpass.is_public_unit({"name": "Breast Care Centre", "healthcare:speciality": "oncology"}, gb))
+        self.assertFalse(overpass.is_public_unit({"name": "Prime Endoscopy Bristol", "healthcare:speciality": "endoscopy"}, gb))
+        self.assertFalse(overpass.is_public_unit({"name": "Circus Dental", "operator": "Bupa"}, gb))
+
+    def test_public_units_outside_the_uk(self):
+        # In the US, freestanding ERs, urgent care and oncology clinics are private businesses.
+        for tags in ({"name": "Frontline ER", "healthcare:speciality": "emergency"},
+                     {"name": "ER of Dallas - Emergency Room", "building": "hospital", "healthcare:speciality": "emergency"},
+                     {"name": "Citra Urgent Care", "healthcare:speciality": "emergency"},
+                     {"name": "Texas Imaging & Infusion Center", "operator": "Texas Oncology",
+                      "healthcare:speciality": "oncology"},
+                     {"name": "MinuteClinic walk-in clinic"}):
+            self.assertFalse(overpass.is_public_unit(tags, "us"), tags["name"])
+        for tags in ({"name": "Moody Outpatient Center at Parkland Hospital"},
+                     {"name": "Cancer Care Outpatient Building", "operator": "University of Texas Southwestern"},
+                     {"name": "County Clinic", "operator:type": "government"}):
+            self.assertTrue(overpass.is_public_unit(tags, "us"), tags["name"])
 
     def test_parse_skips_unnamed_and_merges_nearby_duplicates(self):
         data = {"elements": [
@@ -522,6 +537,129 @@ class SecondReviewFixTests(unittest.TestCase):
         brave = BraveLookup(NoCalls())
         brave.enabled, brave.key = True, "test-key"
         self.assertEqual(brave.find_website("東京歯科", "Tokyo"), (None, False))
+
+
+class ContactTests(unittest.TestCase):
+    def test_emails_and_socials_from_homepage(self):
+        hidden = "".join(f"{b ^ 0x42:02x}" for b in b"info@smile.example")
+        html = GOOD_SITE.replace("</body>", f"""
+            <a href="mailto:Bookings@Smile.example?subject=Hi">Email</a>
+            <span class="__cf_email__" data-cfemail="42{hidden}">[email protected]</span>
+            reception@smile.example logo@2x.png
+            <a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>
+            <a href="https://instagram.com/smile_dental">IG</a></body>""")
+        result = analyse_html(html, "https://smile.example/", 0.5, today=TODAY)
+        self.assertEqual(result["emails"], ["Bookings@Smile.example", "info@smile.example", "reception@smile.example"])
+        self.assertEqual(result["socials"], {"Facebook": "https://www.facebook.com/smiledental",
+                                             "Instagram": "https://instagram.com/smile_dental"})
+
+    def test_contacts_from_map_tags(self):
+        data = {"elements": [{"type": "node", "id": 42, "lat": 1, "lon": 1, "tags": {
+            "amenity": "dentist", "name": "Smile", "email": "hi@smile.example", "contact:facebook": "smiledental",
+            "instagram": "@smile_ig", "website": "https://www.nhs.uk/services/dentist/x"}}]}
+        clinic = overpass.parse_elements(data)[0]
+        self.assertEqual(clinic["emails"], ["hi@smile.example"])
+        self.assertEqual(clinic["socials"], {"Facebook": "https://www.facebook.com/smiledental",
+                                             "Instagram": "https://www.instagram.com/smile_ig"})
+        self.assertEqual(clinic["listing_url"], "https://www.nhs.uk/services/dentist/x")
+
+
+class DiscordTests(unittest.TestCase):
+    LEAD = {"name": "Smile *Dental* @everyone", "score": 10, "phone": "+1 214 555 0100",
+            "emails": ["hi@smile.example"], "address": "1 Main St, Dallas", "website": "https://smile.example/",
+            "issues": "website down (timed out)", "note": "Their website is broken (timed out).",
+            "socials": {"Facebook": "https://www.facebook.com/smile"}, "osm_url": "https://www.openstreetmap.org/node/1",
+            "listing_url": "https://www.yelp.com/biz/smile"}
+
+    def card(self, lead=None):
+        from clinic_scout.discord import build_card
+        return build_card(1, lead or self.LEAD, "Dallas, Texas, United States")
+
+    def field(self, card, name):
+        return next(f["value"] for f in card["fields"] if f["name"] == name)
+
+    def test_card_has_every_detail_and_link(self):
+        card = self.card()
+        self.assertIn("Smile *Dental*", card["title"])
+        self.assertEqual(card["url"], "https://smile.example/")
+        self.assertEqual(self.field(card, "Email"), "hi@smile.example")
+        self.assertIn("[Facebook](https://www.facebook.com/smile)", self.field(card, "Social media"))
+        listed = self.field(card, "Where they're listed")
+        self.assertIn("[OpenStreetMap](https://www.openstreetmap.org/node/1)", listed)
+        self.assertIn("[yelp.com page](https://www.yelp.com/biz/smile)", listed)
+        lookup = self.field(card, "Look them up")
+        self.assertIn("(https://www.google.com/search?q=Smile+%2ADental%2A+%40everyone+1+Main+St%2C+Dallas)", lookup)
+        self.assertIn("https://www.google.com/maps/search/?api=1&query=", lookup)
+        self.assertIn("[📲 Share on WhatsApp (full lead details)](https://wa.me/?text=", card["description"])
+
+    def test_whatsapp_message_has_everything_on_the_card(self):
+        import re
+        from urllib.parse import unquote
+        card = self.card()
+        link = re.search(r"\]\((https://wa\.me/\?text=[^)\s]+)\)", card["description"]).group(1)
+        message = unquote(link.split("text=", 1)[1])
+        for field in card["fields"]:
+            self.assertIn(f"*{field['name']}:*", message)
+            for url in re.findall(r"\]\((https?://[^)]+)\)", field["value"]):  # every link on the card
+                self.assertIn(url, message)
+        for detail in ("+1 214 555 0100", "hi@smile.example", "1 Main St, Dallas", "https://smile.example/",
+                       "website down (timed out)", "Their website is broken (timed out).", "Smile *Dental*"):
+            self.assertIn(detail, message)
+
+    def test_card_respects_discord_limits(self):
+        from clinic_scout import discord
+        long_lead = dict(self.LEAD, name="N" * 400, note="x" * 5000, issues="; ".join(["no HTTPS"] * 400),
+                         address="A" * 2000)
+        card = self.card(long_lead)
+        self.assertLessEqual(len(card["title"]), 256)
+        self.assertTrue(all(len(f["value"]) <= 1024 for f in card["fields"]))
+        self.assertLessEqual(discord._size(card), 6000)
+        self.assertLessEqual(len(card["description"]), 4096)
+        self.assertRegex(card["description"], r"\(https://wa\.me/\?text=[^)\s]+\)$")  # link kept whole
+
+    def test_missing_details_say_so(self):
+        card = self.card(dict(self.LEAD, emails=[], socials={}, phone="", website="", listing_url=""))
+        self.assertEqual(self.field(card, "Email"), "Not found")
+        self.assertEqual(self.field(card, "Social media"), "None found")
+        self.assertNotIn("url", card)
+
+    def test_post_leads_one_card_per_lead_and_no_pings(self):
+        from clinic_scout import discord
+
+        class Http:
+            def __init__(self):
+                self.payloads = []
+
+            def post(self, url, json=None, **kwargs):
+                self.payloads.append(json)
+                return type("R", (), {"status_code": 200, "text": "{}"})()
+
+        http = Http()
+        posted = discord.post_leads(http, "https://discord.com/api/webhooks/1/abc", [self.LEAD, self.LEAD], "Dallas", 100)
+        self.assertEqual(posted, 2)
+        self.assertEqual(len(http.payloads), 3)  # header + one message per lead
+        self.assertTrue(all(len(p.get("embeds", [])) <= 1 for p in http.payloads))
+        self.assertTrue(all(p["allowed_mentions"] == {"parse": []} for p in http.payloads))
+
+    def test_rejected_webhook_stops_quietly(self):
+        from clinic_scout import discord
+
+        class Http:
+            calls = 0
+
+            def post(self, url, **kwargs):
+                Http.calls += 1
+                return type("R", (), {"status_code": 404, "text": "Unknown Webhook"})()
+
+        self.assertEqual(discord.post_leads(Http(), "https://discord.com/api/webhooks/1/abc", [self.LEAD], "X", 1), 0)
+        self.assertEqual(Http.calls, 1)
+
+    def test_webhook_url_check(self):
+        from clinic_scout.discord import is_webhook_url
+        self.assertTrue(is_webhook_url("https://discord.com/api/webhooks/123/AbC-d_e"))
+        self.assertTrue(is_webhook_url("https://ptb.discordapp.com/api/webhooks/123/x"))
+        self.assertFalse(is_webhook_url("https://evil.example/api/webhooks/123/x"))
+        self.assertFalse(is_webhook_url(""))
 
 
 if __name__ == "__main__":
