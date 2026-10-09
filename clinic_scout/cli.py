@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from clinic_scout import discord, nominatim, output, overpass, scoring
 from clinic_scout.brave import BraveLookup
 from clinic_scout.http_client import PoliteSession, RobotsCache
-from clinic_scout.hosts import listing_host
+from clinic_scout.hosts import clean_emails, listing_host
 from clinic_scout.website_checks import check_website
 from clinic_scout.website_finder import WebsiteFinder
 
@@ -128,8 +128,8 @@ def assess(http, robots, finder, brave, clinic, city_name):
             result = check_website(http, robots, found)
     info += result["info"]
     # Contacts published on their own site, added to any from the map.
-    clinic["emails"] = list(dict.fromkeys(clinic.get("emails", []) + result.get("emails", [])))[:3]
-    clinic["socials"] = {**clinic.get("socials", {}), **result.get("socials", {})}
+    clinic["emails"] = clean_emails(clinic.get("emails", []) + result.get("emails", []))
+    clinic["socials"] = {**result.get("socials", {}), **clinic.get("socials", {})}  # map entries win
     if any("checked the homepage instead" in i for i in info):
         clinic["website"] = result["url"]
     if not clinic["phone"] and result.get("phone"):
