@@ -7,7 +7,7 @@ import re
 import requests
 
 from clinic_scout import cache
-from clinic_scout.hosts import listing_host
+from clinic_scout.hosts import listing_host, social_profile
 
 DEFAULT_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -101,11 +101,54 @@ def is_public_unit(tags, country_code=""):
     )
 
 
+# OSM social tags hold either a full URL or just a handle.
+SOCIAL_TAGS = {
+    "Facebook": (("contact:facebook", "facebook"), "https://www.facebook.com/"),
+    "Instagram": (("contact:instagram", "instagram"), "https://www.instagram.com/"),
+    "X": (("contact:twitter", "twitter", "contact:x"), "https://x.com/"),
+    "LinkedIn": (("contact:linkedin", "linkedin"), "https://www.linkedin.com/company/"),
+    "TikTok": (("contact:tiktok", "tiktok"), "https://www.tiktok.com/@"),
+    "YouTube": (("contact:youtube", "youtube"), "https://www.youtube.com/"),
+}
+
+
+def _website_values(tags):
+    raw = tags.get("website") or tags.get("contact:website") or tags.get("url") or ""
+    return [v.strip() for v in raw.split(";") if v.strip()]
+
+
+def _emails(tags):
+    raw = tags.get("email") or tags.get("contact:email") or ""
+    return [e.strip() for e in raw.split(";") if "@" in e][:3]
+
+
+def _socials(tags):
+    """Social accounts from OSM tags (and a website tag that points at a social page)."""
+    found = {}
+    for network, (keys, base) in SOCIAL_TAGS.items():
+        value = next((tags[k] for k in keys if tags.get(k)), "").split(";")[0].strip()
+        if not value:
+            continue
+        if not re.match(r"^https?://", value, re.I):
+            value = value.lstrip("@")
+            value = "https://" + value if "." in value.split("/")[0] else base + value
+        found[network] = value
+    for value in _website_values(tags):
+        profile = social_profile(value if "//" in value else "https://" + value)
+        if profile and profile[0] not in found:
+            found[profile[0]] = profile[1]
+    return found
+
+
 def _website(tags):
     """The clinic's website tag. OSM allows several values ("a;b"): prefer one that isn't a listing page."""
-    raw = tags.get("website") or tags.get("contact:website") or tags.get("url") or ""
-    values = [v.strip() for v in raw.split(";") if v.strip()]
+    values = _website_values(tags)
     return next((v for v in values if not listing_host(v)), values[0] if values else "")
+
+
+def _listing_url(tags):
+    """A directory/social page the map links to as the clinic's website (e.g. an nhs.uk page)."""
+    return next((v for v in _website_values(tags) if listing_host(v)), "")
 
 
 def _distance_m(a, b):
@@ -139,6 +182,9 @@ def parse_elements(data, country_code=""):
             "postcode": tags.get("addr:postcode", ""),
             "street": tags.get("addr:street", ""),
             "public": is_public_unit(tags, country_code),
+            "emails": _emails(tags),
+            "socials": _socials(tags),
+            "listing_url": _listing_url(tags),
             "osm_url": f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
             "lat": center.get("lat"),
             "lon": center.get("lon"),

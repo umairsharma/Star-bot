@@ -34,6 +34,11 @@ on:
         required: true
         default: "clinic,doctors,dentist"
         type: string
+      post_to_discord:
+        description: "Post one card per lead to Discord (needs the DISCORD_WEBHOOK_URL secret)"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -61,10 +66,14 @@ jobs:
           LIMIT: ${{ inputs.limit }}
           TOP: ${{ inputs.top }}
           TYPES: ${{ inputs.types }}
+          POST_TO_DISCORD: ${{ inputs.post_to_discord }}
           BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}  # optional repository secret
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}  # optional repository secret
         run: |
+          extra=()
+          if [ "$POST_TO_DISCORD" = "false" ]; then extra+=(--no-discord); fi
           clinic-scout --city "$CITY" --country "$COUNTRY" ${REGION:+--region "$REGION"} \
-            --limit "$LIMIT" --top "$TOP" --types "$TYPES" --output results.csv
+            --limit "$LIMIT" --top "$TOP" --types "$TYPES" --output results.csv "${extra[@]}"
 
       - name: Show results on the run page
         if: always() && hashFiles('results.csv') != ''

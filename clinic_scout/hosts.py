@@ -6,7 +6,7 @@ fetched, not even through a redirect or a robots.txt request.
 """
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 LISTING_HOSTS = (
     # Google and Meta, including their short links
@@ -64,4 +64,40 @@ def listing_host(url):
     for h in LISTING_HOSTS:
         if host == h or host.endswith("." + h):
             return h
+    return None
+
+
+# Social networks we list on lead cards (links only: these sites are never fetched).
+SOCIAL_NETWORKS = (
+    ("Facebook", ("facebook.com", "fb.com", "fb.me")),
+    ("Instagram", ("instagram.com", "instagr.am")),
+    ("X", ("twitter.com", "x.com")),
+    ("LinkedIn", ("linkedin.com",)),
+    ("TikTok", ("tiktok.com",)),
+    ("YouTube", ("youtube.com",)),
+)
+# Paths that are share buttons, pixels, widgets or policy pages rather than someone's profile.
+NOT_A_PROFILE = re.compile(
+    r"^/(sharer|share|plugins|dialog|tr|intent|hashtag|home|login|signup|policies|privacy|legal|help|"
+    r"watch|embed|search|results|about|terms)\b",
+    re.I,
+)
+
+
+def social_profile(url):
+    """Return (network, url) if `url` links to a social media profile or page, else None."""
+    host = host_of(url)
+    for network, hosts in SOCIAL_NETWORKS:
+        if not any(host == h or host.endswith("." + h) for h in hosts):
+            continue
+        try:
+            parts = urlparse(url)
+        except ValueError:
+            return None
+        if network == "Facebook" and parts.path.startswith("/plugins"):  # page widget: the page is in ?href=
+            href = parse_qs(parts.query).get("href", [""])[0]
+            return social_profile(href) if href.startswith("http") else None
+        if not parts.path.strip("/") or NOT_A_PROFILE.match(parts.path):
+            return None
+        return network, url.split("#")[0]
     return None

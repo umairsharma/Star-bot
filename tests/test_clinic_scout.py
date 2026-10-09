@@ -539,5 +539,113 @@ class SecondReviewFixTests(unittest.TestCase):
         self.assertEqual(brave.find_website("東京歯科", "Tokyo"), (None, False))
 
 
+class ContactTests(unittest.TestCase):
+    def test_emails_and_socials_from_homepage(self):
+        hidden = "".join(f"{b ^ 0x42:02x}" for b in b"info@smile.example")
+        html = GOOD_SITE.replace("</body>", f"""
+            <a href="mailto:Bookings@Smile.example?subject=Hi">Email</a>
+            <span class="__cf_email__" data-cfemail="42{hidden}">[email protected]</span>
+            reception@smile.example logo@2x.png
+            <a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>
+            <a href="https://instagram.com/smile_dental">IG</a></body>""")
+        result = analyse_html(html, "https://smile.example/", 0.5, today=TODAY)
+        self.assertEqual(result["emails"], ["Bookings@Smile.example", "info@smile.example", "reception@smile.example"])
+        self.assertEqual(result["socials"], {"Facebook": "https://www.facebook.com/smiledental",
+                                             "Instagram": "https://instagram.com/smile_dental"})
+
+    def test_contacts_from_map_tags(self):
+        data = {"elements": [{"type": "node", "id": 42, "lat": 1, "lon": 1, "tags": {
+            "amenity": "dentist", "name": "Smile", "email": "hi@smile.example", "contact:facebook": "smiledental",
+            "instagram": "@smile_ig", "website": "https://www.nhs.uk/services/dentist/x"}}]}
+        clinic = overpass.parse_elements(data)[0]
+        self.assertEqual(clinic["emails"], ["hi@smile.example"])
+        self.assertEqual(clinic["socials"], {"Facebook": "https://www.facebook.com/smiledental",
+                                             "Instagram": "https://www.instagram.com/smile_ig"})
+        self.assertEqual(clinic["listing_url"], "https://www.nhs.uk/services/dentist/x")
+
+
+class DiscordTests(unittest.TestCase):
+    LEAD = {"name": "Smile *Dental* @everyone", "score": 10, "phone": "+1 214 555 0100",
+            "emails": ["hi@smile.example"], "address": "1 Main St, Dallas", "website": "https://smile.example/",
+            "issues": "website down (timed out)", "note": "Their website is broken (timed out).",
+            "socials": {"Facebook": "https://www.facebook.com/smile"}, "osm_url": "https://www.openstreetmap.org/node/1",
+            "listing_url": "https://www.yelp.com/biz/smile"}
+
+    def card(self, lead=None):
+        from clinic_scout.discord import build_card
+        return build_card(1, lead or self.LEAD, "Dallas, Texas, United States")
+
+    def field(self, card, name):
+        return next(f["value"] for f in card["fields"] if f["name"] == name)
+
+    def test_card_has_every_detail_and_link(self):
+        card = self.card()
+        self.assertIn("Smile *Dental*", card["title"])
+        self.assertEqual(card["url"], "https://smile.example/")
+        self.assertEqual(self.field(card, "Email"), "hi@smile.example")
+        self.assertIn("[Facebook](https://www.facebook.com/smile)", self.field(card, "Social media"))
+        listed = self.field(card, "Where they're listed")
+        self.assertIn("[OpenStreetMap](https://www.openstreetmap.org/node/1)", listed)
+        self.assertIn("[yelp.com page](https://www.yelp.com/biz/smile)", listed)
+        lookup = self.field(card, "Look them up")
+        self.assertIn("(https://www.google.com/search?q=Smile+%2ADental%2A+%40everyone+1+Main+St%2C+Dallas)", lookup)
+        self.assertIn("https://www.google.com/maps/search/?api=1&query=", lookup)
+        self.assertTrue(self.field(card, "Share").startswith("[Share on WhatsApp](https://wa.me/?text=Lead%3A%20Smile"))
+
+    def test_card_respects_discord_limits(self):
+        from clinic_scout import discord
+        long_lead = dict(self.LEAD, name="N" * 400, note="x" * 5000, issues="; ".join(["no HTTPS"] * 400),
+                         address="A" * 2000)
+        card = self.card(long_lead)
+        self.assertLessEqual(len(card["title"]), 256)
+        self.assertTrue(all(len(f["value"]) <= 1024 for f in card["fields"]))
+        self.assertLessEqual(discord._size(card), 6000)
+        self.assertIn("wa.me", self.field(card, "Share"))  # links are never cut in half
+
+    def test_missing_details_say_so(self):
+        card = self.card(dict(self.LEAD, emails=[], socials={}, phone="", website="", listing_url=""))
+        self.assertEqual(self.field(card, "Email"), "Not found")
+        self.assertEqual(self.field(card, "Social media"), "None found")
+        self.assertNotIn("url", card)
+
+    def test_post_leads_one_card_per_lead_and_no_pings(self):
+        from clinic_scout import discord
+
+        class Http:
+            def __init__(self):
+                self.payloads = []
+
+            def post(self, url, json=None, **kwargs):
+                self.payloads.append(json)
+                return type("R", (), {"status_code": 200, "text": "{}"})()
+
+        http = Http()
+        posted = discord.post_leads(http, "https://discord.com/api/webhooks/1/abc", [self.LEAD, self.LEAD], "Dallas", 100)
+        self.assertEqual(posted, 2)
+        self.assertEqual(len(http.payloads), 3)  # header + one message per lead
+        self.assertTrue(all(len(p.get("embeds", [])) <= 1 for p in http.payloads))
+        self.assertTrue(all(p["allowed_mentions"] == {"parse": []} for p in http.payloads))
+
+    def test_rejected_webhook_stops_quietly(self):
+        from clinic_scout import discord
+
+        class Http:
+            calls = 0
+
+            def post(self, url, **kwargs):
+                Http.calls += 1
+                return type("R", (), {"status_code": 404, "text": "Unknown Webhook"})()
+
+        self.assertEqual(discord.post_leads(Http(), "https://discord.com/api/webhooks/1/abc", [self.LEAD], "X", 1), 0)
+        self.assertEqual(Http.calls, 1)
+
+    def test_webhook_url_check(self):
+        from clinic_scout.discord import is_webhook_url
+        self.assertTrue(is_webhook_url("https://discord.com/api/webhooks/123/AbC-d_e"))
+        self.assertTrue(is_webhook_url("https://ptb.discordapp.com/api/webhooks/123/x"))
+        self.assertFalse(is_webhook_url("https://evil.example/api/webhooks/123/x"))
+        self.assertFalse(is_webhook_url(""))
+
+
 if __name__ == "__main__":
     unittest.main()

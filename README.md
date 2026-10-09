@@ -33,6 +33,7 @@ clinic-scout --city Bath --country "United Kingdom" --limit 20
 | `--output` | `results.csv` | Output file |
 | `--refresh` | off | Ignore cached OpenStreetMap results (Nominatim and Overpass, cached for 24 h in `.cache/`) |
 | `--include-public` | off | Keep public and hospital units (skipped by default) |
+| `--no-discord` | off | Don't post lead cards to Discord even if `DISCORD_WEBHOOK_URL` is set |
 
 Output: `results.csv` with `name, phone, address, website, score, issues, note`,
 plus a summary table in the terminal.
@@ -51,6 +52,24 @@ The repo includes a GitHub Actions workflow, so GitHub's servers can run it for 
 To enable the optional Brave check there, add `BRAVE_API_KEY` as a repository secret
 (Settings → Secrets and variables → Actions). GitHub Actions is free for public
 repos; private repos on the Free plan get a monthly allowance of free minutes.
+
+## Post leads to Discord
+
+Each lead can be posted to a Discord channel as its own card. Every card includes:
+- **Details:** score, the note, phone, email, address, website and what's wrong.
+- **Social media:** accounts from the clinic's website and the map data.
+- **Where they're listed:** their OpenStreetMap entry, plus any directory page the map links to.
+- **Lookups:** "Search on Google" (normally shows their Google business panel) and "Open in Google Maps".
+- **"Share on WhatsApp":** a pre-filled message with the lead's details.
+
+The Google, Maps and WhatsApp entries are plain links on the card. clinic-scout never visits those sites itself.
+
+Setup (works from a phone):
+1. **In Discord:** long-press your channel, tap **Edit Channel**, then **Integrations**, **Webhooks**, **New Webhook**. Copy its URL.
+2. **On github.com:** open the repo, then **Settings**, **Secrets and variables**, **Actions**, **New repository secret**. Name it `DISCORD_WEBHOOK_URL` and paste the URL.
+3. **Run it:** use **Run workflow** as above. Untick "Post to Discord" for a run you don't want posted.
+
+Running on a computer instead, put `DISCORD_WEBHOOK_URL=...` in `.env`. Use `--no-discord` to skip posting. Treat the webhook URL like a password: anyone who has it can post to your channel.
 
 ## How it works
 
@@ -122,6 +141,7 @@ repos; private repos on the Free plan get a monthly allowance of free minutes.
 | Variable | Purpose |
 |---|---|
 | `BRAVE_API_KEY` | Enables the optional Brave lookup |
+| `DISCORD_WEBHOOK_URL` | Posts one card per lead to that Discord channel |
 | `CONTACT_EMAIL` | Added to the User-Agent |
 | `OVERPASS_URL` | Use one specific Overpass server |
 
