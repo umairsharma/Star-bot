@@ -15,8 +15,7 @@ from clinic_scout.hosts import listing_host
 WEBHOOK_URL = re.compile(r"^https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+/?$")
 # Discord limits: https://discord.com/developers/docs/resources/message#embed-object-embed-limits
 TITLE_MAX, DESCRIPTION_MAX, FIELD_MAX, EMBED_TOTAL_MAX = 256, 4096, 1024, 6000
-SHARE_TEXT_MAX = 400
-LINK_MAX = 1000  # a single link must fit in one 1024-character field
+SHARE_LINK_MAX = 3500  # the WhatsApp link goes in the card description (4096 max)
 FOOTER = "clinic-scout · Clinic data © OpenStreetMap contributors (ODbL)"
 NO_MENTIONS = {"parse": []}  # a clinic called "@everyone" must not ping the channel
 
@@ -61,24 +60,65 @@ def google_maps_url(lead, city):
     return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(_lookup_text(lead, city))
 
 
-def whatsapp_share_url(lead, city):
-    lines = [
-        f"Lead: {lead['name']} (score {lead['score']})",
-        lead.get("note", ""),
-        f"Phone: {lead['phone']}" if lead.get("phone") else "",
-        f"Email: {', '.join(lead['emails'])}" if lead.get("emails") else "",
-        f"Address: {lead['address']}" if lead.get("address") else "",
-        f"Website: {lead['website']}" if lead.get("website") else "",
-        f"Maps: {google_maps_url(lead, city)}",
+def _listing_label(url):
+    return f"{listing_host(url)} page" if url else ""
+
+
+EMPTY_LINKS = {"Social media": "None found", "Where they're listed": "Not found"}
+FREE_TEXT_FIELDS = {"Address", "What's wrong"}  # shortened first when a WhatsApp link gets too long
+
+
+def card_sections(lead, city):
+    """The lead's details in card order, shared by the Discord card and the WhatsApp message
+    so the two always match.
+
+    Returns (fields, link_groups): fields are (label, text); link groups are (label, [(name, url), ...]).
+    """
+    listing = lead.get("listing_url")
+    fields = [
+        ("Score", str(lead["score"])),
+        ("Phone", lead.get("phone") or "Not listed"),
+        ("Email", ", ".join(lead.get("emails") or []) or "Not found"),
+        ("Address", lead.get("address") or "Not listed"),
+        ("Website", lead.get("website") or "None found"),
+        ("What's wrong", lead.get("issues") or "Nothing found"),
     ]
-    details, maps = "\n".join(line for line in lines[:-1] if line), lines[-1]
-    budget = SHARE_TEXT_MAX
-    while True:  # shorten the details (never the Maps link) until the whole link fits in a card field
-        text = _clip(details, max(budget - len(maps) - 1, 20)) + "\n" + maps
-        url = "https://wa.me/?text=" + quote(text, safe="")
-        if len(url) <= LINK_MAX or budget <= len(maps) + 21:
-            return url
-        budget -= 50
+    links = [
+        ("Social media", sorted((lead.get("socials") or {}).items())),
+        ("Where they're listed", [(name, url) for name, url in
+                                  (("OpenStreetMap", lead.get("osm_url")), (_listing_label(listing), listing)) if url]),
+        ("Look them up", [("Search on Google", google_search_url(lead, city)),
+                          ("Open in Google Maps", google_maps_url(lead, city))]),
+    ]
+    return fields, links
+
+
+def whatsapp_text(rank, lead, city, clip=None):
+    """Everything on the card as a WhatsApp message (*bold* labels, one link per line).
+
+    `clip` shortens the free-text parts (name, note, address, issues) when the link would be too long.
+    """
+    fields, links = card_sections(lead, city)
+    cut = (lambda text: _clip(text, clip)) if clip else (lambda text: text)
+    lines = [f"*#{rank} · {cut(lead['name'])}*", cut(lead.get("note") or ""), ""]
+    for label, text in fields:
+        lines.append(f"*{label}:* {cut(text) if label in FREE_TEXT_FIELDS else text}")
+    for label, pairs in links:
+        if pairs:
+            lines.append(f"*{label}:*")
+            lines += [f"• {name}: {url}" for name, url in pairs]
+        else:
+            lines.append(f"*{label}:* {EMPTY_LINKS.get(label, '')}")
+    return "\n".join(line for i, line in enumerate(lines) if line or i == 2).strip()
+
+
+def whatsapp_share_url(rank, lead, city):
+    """wa.me link pre-filled with the whole card. Long free text is shortened, links are kept."""
+    for clip in (None, 300, 120, 50):
+        url = "https://wa.me/?text=" + quote(whatsapp_text(rank, lead, city, clip), safe=":/,@")
+        if len(url) <= SHARE_LINK_MAX:
+            break
+    return url
 
 
 def _color(score):
@@ -93,40 +133,27 @@ def _color(score):
 
 def build_card(rank, lead, city):
     """One Discord embed for one lead, within Discord's size limits."""
-    socials = _links(sorted(lead.get("socials", {}).items()))
-    listed = _links([("OpenStreetMap", lead.get("osm_url")),
-                     (_listing_label(lead.get("listing_url")), lead.get("listing_url"))])
-    lookup = _links([("Search on Google", google_search_url(lead, city)),
-                     ("Open in Google Maps", google_maps_url(lead, city))])
-    share = _links([("Share on WhatsApp", whatsapp_share_url(lead, city))])
+    fields, links = card_sections(lead, city)
+    embed_fields = []
+    for label, text in fields:
+        value = text if label == "Website" and text.startswith("http") else _escape(text)
+        embed_fields.append({"name": label, "value": _clip(value, FIELD_MAX),
+                             "inline": label in ("Score", "Phone", "Email")})
+    for label, pairs in links:
+        embed_fields.append({"name": label, "value": _links(pairs) or EMPTY_LINKS.get(label, "-"), "inline": False})
     website = lead.get("website") or ""
-    fields = [
-        ("Score", str(lead["score"]), True),
-        ("Phone", _escape(lead.get("phone")) or "Not listed", True),
-        ("Email", _escape(", ".join(lead.get("emails") or [])) or "Not found", True),
-        ("Address", _escape(lead.get("address")) or "Not listed", False),
-        ("Website", website if website.startswith("http") else _escape(website) or "None found", False),
-        ("What's wrong", _escape(lead.get("issues")) or "Nothing found", False),
-        ("Social media", socials or "None found", False),
-        ("Where they're listed", listed or "Not found", False),
-        ("Look them up", lookup, False),
-        ("Share", share, False),
-    ]
     embed = {
         "title": _clip(f"#{rank} · {lead['name']}", TITLE_MAX),
-        "description": _clip(_escape(lead.get("note")), DESCRIPTION_MAX),
+        "description": "",
         "color": _color(lead["score"]),
-        "fields": [{"name": n, "value": _clip(v, FIELD_MAX), "inline": i} for n, v, i in fields],
+        "fields": embed_fields,
         "footer": {"text": FOOTER},
     }
     if website.startswith("http"):
         embed["url"] = website
-    _fit(embed)
+    share = f"[📲 Share on WhatsApp (full lead details)]({whatsapp_share_url(rank, lead, city)})"
+    _fit(embed, _escape(lead.get("note")), share)
     return embed
-
-
-def _listing_label(url):
-    return f"{listing_host(url)} page" if url else ""
 
 
 def _size(embed):
@@ -134,17 +161,16 @@ def _size(embed):
             + sum(len(f["name"]) + len(f["value"]) for f in embed["fields"]))
 
 
-def _fit(embed):
-    """Trim the longest free-text parts until the card is under Discord's 6000-character total."""
-    while _size(embed) > EMBED_TOTAL_MAX:
-        over = _size(embed) - EMBED_TOTAL_MAX
-        issues = next(f for f in embed["fields"] if f["name"] == "What's wrong")
-        if len(issues["value"]) > 100:
-            issues["value"] = _clip(issues["value"], max(100, len(issues["value"]) - over))
-        else:
-            embed["description"] = _clip(embed["description"], max(50, len(embed["description"]) - over))
-            if len(embed["description"]) <= 50:
-                break
+def _fit(embed, note, share):
+    """Set the description (note, then the WhatsApp link) and keep the whole card under
+    Discord's 6000-character total. The link is never cut; the issues list and note are."""
+    tail = "\n\n" + share
+    issues = next(f for f in embed["fields"] if f["name"] == "What's wrong")
+    over = _size(embed) + len(tail) + 100 - EMBED_TOTAL_MAX  # leave room for at least some of the note
+    if over > 0 and len(issues["value"]) > 100:
+        issues["value"] = _clip(issues["value"], max(100, len(issues["value"]) - over))
+    budget = min(DESCRIPTION_MAX, EMBED_TOTAL_MAX - _size(embed)) - len(tail)
+    embed["description"] = (_clip(note, budget) if budget > 0 else "") + tail
 
 
 def post_leads(http, webhook_url, leads, city, checked):

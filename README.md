@@ -60,7 +60,7 @@ Each lead can be posted to a Discord channel as its own card. Every card include
 - **Social media:** accounts from the clinic's website and the map data.
 - **Where they're listed:** their OpenStreetMap entry, plus any directory page the map links to.
 - **Lookups:** "Search on Google" (normally shows their Google business panel) and "Open in Google Maps".
-- **"Share on WhatsApp":** a pre-filled message with the lead's details.
+- **"Share on WhatsApp":** a link near the top of the card. It opens WhatsApp with a message containing everything on the card: all the details and every link.
 
 The Google, Maps and WhatsApp entries are plain links on the card. clinic-scout never visits those sites itself.
 

@@ -590,7 +590,21 @@ class DiscordTests(unittest.TestCase):
         lookup = self.field(card, "Look them up")
         self.assertIn("(https://www.google.com/search?q=Smile+%2ADental%2A+%40everyone+1+Main+St%2C+Dallas)", lookup)
         self.assertIn("https://www.google.com/maps/search/?api=1&query=", lookup)
-        self.assertTrue(self.field(card, "Share").startswith("[Share on WhatsApp](https://wa.me/?text=Lead%3A%20Smile"))
+        self.assertIn("[📲 Share on WhatsApp (full lead details)](https://wa.me/?text=", card["description"])
+
+    def test_whatsapp_message_has_everything_on_the_card(self):
+        import re
+        from urllib.parse import unquote
+        card = self.card()
+        link = re.search(r"\]\((https://wa\.me/\?text=[^)\s]+)\)", card["description"]).group(1)
+        message = unquote(link.split("text=", 1)[1])
+        for field in card["fields"]:
+            self.assertIn(f"*{field['name']}:*", message)
+            for url in re.findall(r"\]\((https?://[^)]+)\)", field["value"]):  # every link on the card
+                self.assertIn(url, message)
+        for detail in ("+1 214 555 0100", "hi@smile.example", "1 Main St, Dallas", "https://smile.example/",
+                       "website down (timed out)", "Their website is broken (timed out).", "Smile *Dental*"):
+            self.assertIn(detail, message)
 
     def test_card_respects_discord_limits(self):
         from clinic_scout import discord
@@ -600,7 +614,8 @@ class DiscordTests(unittest.TestCase):
         self.assertLessEqual(len(card["title"]), 256)
         self.assertTrue(all(len(f["value"]) <= 1024 for f in card["fields"]))
         self.assertLessEqual(discord._size(card), 6000)
-        self.assertIn("wa.me", self.field(card, "Share"))  # links are never cut in half
+        self.assertLessEqual(len(card["description"]), 4096)
+        self.assertRegex(card["description"], r"\(https://wa\.me/\?text=[^)\s]+\)$")  # link kept whole
 
     def test_missing_details_say_so(self):
         card = self.card(dict(self.LEAD, emails=[], socials={}, phone="", website="", listing_url=""))
